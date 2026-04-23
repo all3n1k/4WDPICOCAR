@@ -6,6 +6,22 @@ Format: loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versio
 
 ---
 
+## [5.5.2] — 2026-04-23
+
+Chassis-LED recovery.
+
+### Fixed
+
+- **WS2812 strip on GP19 was disabled and replaced with non-existent hardware.** A prior edit had commented out `np = WS2812(Pin(19, Pin.OUT), 24)`, gutted every `set_light_*` body, and added `PWM(Pin(19/20/21/22))` initialisers for analog LEDs that aren't wired in this build (GP20/21/22 are the free-GPIO pins in `docs/USER_GUIDE.md`). It also imported `PWM` nowhere — so `libs/pico_4wd.py` raised `NameError` at import time, which on the Pico probably cascaded into the whole stack failing at boot. Restored the PIO-driven WS2812 driver and the real function bodies (`write_light_color_at`, `light_excute`, `set_light_all_color`, `set_light_bottom_color`, `set_light_bottom_left_color`, `set_light_bottom_right_color`, `set_light_rear_color`, `set_light_off`). Deleted the bogus PWM block.
+- **`set_light_off` called a function that had been commented out** (`set_light_all_color`) — now calls the restored version.
+- **Blocking `set_turn_signal(direction)`** used `time.sleep` inside what should be a 200 Hz control loop and was only reached via the `car.move()` fallback in firmware. Removed the blocking implementation and the calls from `move()`.
+
+### Added
+
+- **Non-blocking turn signals in firmware.** `examples/app_control.py` now tracks a `turn_signal` state derived from the incoming `K` command (`left` / `right` with nonzero power) and blinks the corresponding bottom-strip segment amber from the main tick loop: ~3 Hz on the left side when turning left, ~1.5 Hz on the right side when turning right. Matches the `USER_GUIDE.md` v5.5 "Fast=Left, Slow=Right" spec. The cached `L_BOT` colour from the Mac is used as the "off-phase" background so the underglow isn't lost while a signal is active, and it's repainted to both halves when the turn ends. Signals also cancel on the `CMD_TIMEOUT_MS` auto-stop.
+
+---
+
 ## [5.5.1] — 2026-04-23
 
 Bug-fix pass against v5.5. No feature additions.

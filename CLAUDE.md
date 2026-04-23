@@ -23,10 +23,10 @@ A four-wheel robot car (Raspberry Pi Pico + ESP8266 + ESP32-CAM) driven by a Pyt
 - LLM brain: think thread, reflex safety thread, control loop, oscillation detector, tool-calling JSON protocol (`move`/`turn`/`look`/`scan`/`speak`/`set_mood`)
 - Mapping mode (`python3 main_os.py --map`): perimeter trace → boustrophedon sweep → RSSI heatmap → export
 - LiDAR floor-plan import (`python3 dimos_lite/importer.py floorplan.png`)
+- Chassis LED strip on GP19 (24× WS2812, 8 rear + 8 bottom-L + 8 bottom-R). `L_BOT` / `L_REAR` set steady colours; firmware auto-blinks the bottom-left segment amber while turning left (fast ~3 Hz) and the bottom-right segment while turning right (slow ~1.5 Hz), restoring the cached `L_BOT` colour when the turn ends.
 
 ## What doesn't work / known issues
 
-- **Chassis LEDs on PWM pin 19 don't light.** The `L_BOT` / `L_REAR` payloads are received by the Pico and `car.set_light_bottom_color` / `car.set_light_rear_color` are called, but the WS2812 strip on GP19 stays dark. Likely causes to check: wrong pin in `pico_4wd.py` driver, data-line timing issue on the Pico side, power rail to the strip, or `set_light_bottom_color` not actually writing the strip. **This is the next debug target on the hardware side.**
 - **No battery ADC.** `read_battery_v()` is stubbed to return `0.0` — the dashboard shows `N/A`. Adding a real voltage divider on a free GPIO is a pending hardware upgrade.
 - **gemma4:31b latency is 3–6 s on a 3090.** Reflex thread covers the gap; no known regression.
 - **21×21 semantic grid is small** (2.1 m × 2.1 m). Apartment-scale coverage depends on ArUco re-localisation resets. Position override from the dashboard recenters the grid — that's intentional.
@@ -123,7 +123,7 @@ pico_4wd_car-main/
 | 4/5 | UART1 to ESP8266 |
 | 6/7 | HC-SR04 trig/echo |
 | 8/9 | Wheel encoders |
-| 19 | WS2812 chassis LEDs — **not currently lighting** |
+| 19 | WS2812 chassis LEDs (24× — 8 rear + 8 bottom-L + 8 bottom-R), PIO state machine 0 |
 | 25 | Onboard LED |
 | 26/27/28 | Grayscale L/C/R (ADC0–2) |
 | 29 | ADC3 — reads VSYS, not the battery |
@@ -154,4 +154,4 @@ Obvious smart-upgrade directions: richer spatial memory (not just recent thought
 
 ---
 
-_Last snapshot: 2026-04-23. Bump the date on substantive edits._
+_Last snapshot: 2026-04-23 (v5.5.2). Bump the date on substantive edits._

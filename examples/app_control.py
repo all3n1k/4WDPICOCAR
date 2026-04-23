@@ -57,12 +57,55 @@ led_prev = None
 current_radar_sweep = []
 tick_count = 0
 
+# ── Turn-signal state ──────────────────────────────────────────
+# Derived from incoming K commands in on_receive, ticked in the main loop.
+# Fast blink when turning left, slow blink when turning right
+# (matches USER_GUIDE v5.5: "Fast=Left, Slow=Right").
+turn_signal = None            # None | 'left' | 'right'
+turn_signal_prev = None
+turn_signal_phase = False
+turn_signal_last_ms = 0
+last_bot_color = [0, 0, 0]    # most recent L_BOT from Mac (default rest colour)
+TURN_SIGNAL_AMBER = (255, 90, 0)
+TURN_SIGNAL_LEFT_MS = 160     # ~3 Hz
+TURN_SIGNAL_RIGHT_MS = 320    # ~1.5 Hz
+
+
+def update_turn_signal(now_ms):
+    global turn_signal_prev, turn_signal_phase, turn_signal_last_ms
+
+    if turn_signal != turn_signal_prev:
+        # Direction changed — reset phase and repaint both halves.
+        turn_signal_prev = turn_signal
+        turn_signal_phase = False
+        turn_signal_last_ms = now_ms
+        if turn_signal is None:
+            car.set_light_bottom_color(last_bot_color)
+            return
+
+    if turn_signal is None:
+        return
+
+    period = TURN_SIGNAL_LEFT_MS if turn_signal == 'left' else TURN_SIGNAL_RIGHT_MS
+    if time.ticks_diff(now_ms, turn_signal_last_ms) < period:
+        return
+
+    turn_signal_last_ms = now_ms
+    turn_signal_phase = not turn_signal_phase
+    on_color = list(TURN_SIGNAL_AMBER) if turn_signal_phase else list(last_bot_color)
+    if turn_signal == 'left':
+        car.set_light_bottom_left_color(on_color)
+        car.set_light_bottom_right_color(last_bot_color)
+    else:
+        car.set_light_bottom_right_color(on_color)
+        car.set_light_bottom_left_color(last_bot_color)
+
 
 def on_receive(data):
-    global last_cmd_ms, timed_out, servo_override
+    global last_cmd_ms, timed_out, servo_override, turn_signal, last_bot_color
     last_cmd_ms = time.ticks_ms()
     timed_out = False
-    
+
     try:
         # Debug: show what the brain is sending
         if 'L_BOT' in data or 'K' in data:
@@ -73,9 +116,12 @@ def on_receive(data):
             val = data['L']
             servo_override = None if val is None else int(val)
 
-        # 2. LED control
+        # 2. LED control. L_BOT is the steady underglow colour; we cache it so
+        #    turn-signal blinks can fall back to it on the 'off' phase.
         if 'L_BOT' in data:
-            car.set_light_bottom_color(tuple(data['L_BOT']))
+            last_bot_color = list(data['L_BOT'])
+            if turn_signal is None:
+                car.set_light_bottom_color(last_bot_color)
         if 'L_REAR' in data:
             car.set_light_rear_color(tuple(data['L_REAR']))
 
@@ -85,17 +131,23 @@ def on_receive(data):
             power = int(data['A'])
             if direction == 'right':
                 car.set_motor_power(0, -power, -power, power)
+                turn_signal = 'right' if power > 0 else None
             elif direction == 'left':
                 car.set_motor_power(-power, 0, power, -power)
+                turn_signal = 'left' if power > 0 else None
             elif direction == 'forward':
                 car.set_motor_power(power, power, power, power)
+                turn_signal = None
             elif direction == 'backward':
                 car.set_motor_power(-power, -power, -power, -power)
+                turn_signal = None
             else:
                 car.move(direction, power)
+                turn_signal = None
     except Exception as e:
         print("pkt err:", e)
         car.stop()
+        turn_signal = None
 
 # Wire the packet handler into WS_Server (default is a no-op).
 ws.on_receive = on_receive
@@ -106,11 +158,17 @@ while True:
     try:
         ws.loop()
 
+        now_ms = time.ticks_ms()
+
         # Safety: auto-stop if Mac disconnects or stops sending commands
-        if time.ticks_diff(time.ticks_ms(), last_cmd_ms) > CMD_TIMEOUT_MS:
+        if time.ticks_diff(now_ms, last_cmd_ms) > CMD_TIMEOUT_MS:
             if not timed_out:
                 car.stop()
+                turn_signal = None
                 timed_out = True
+
+        # Turn-signal LEDs (non-blocking)
+        update_turn_signal(now_ms)
 
         # Servo sweep or fixed angle
         target_angle = current_angle if servo_override is None else servo_override

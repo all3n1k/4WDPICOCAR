@@ -15,22 +15,15 @@ motors = [left_front, right_front, left_rear, right_rear]
 servo = Servo(18)
 speed = Speed(8, 9)
 
-# np =  WS2812(Pin(19, Pin.OUT), 24) # DISABLED: Interferes with PWM LEDs on Pin 19
+# 24 WS2812 LEDs on GP19: indices 0-7 rear, 8-15 bottom-left, 16-23 bottom-right.
+# Driven by PIO state machine — GP19 is NOT a PWM pin in this build.
+np = WS2812(Pin(19, Pin.OUT), 24)
 
 gs0 = ADC(Pin(26))
 gs1 = ADC(Pin(27))
 gs2 = ADC(Pin(28))
 GRAYSCALE_EDGE_REFERENCE = 20
 GRAYSCALE_LINE_REFERENCE = 10000
-
-# PWM LED Support (fallback for analog LEDs)
-pwm_r = PWM(Pin(20, Pin.OUT))
-pwm_g = PWM(Pin(21, Pin.OUT))
-pwm_b = PWM(Pin(22, Pin.OUT))
-pwm_19 = PWM(Pin(19, Pin.OUT)) # Added Pin 19 PWM support
-for p in [pwm_r, pwm_g, pwm_b, pwm_19]:
-    p.freq(1000)
-    p.duty_u16(0)
 
 # Ultrasonic
 sonar = Ultrasonic(6, 7)
@@ -43,14 +36,20 @@ radar_step = -RADAR_STEP_ANGLE
 radar_angle = 0
 radar_scan_angle = 180
 
-# def set_light_all_color(color):
-#     for i in range(24):
-#         np[i] = color#[color[0], color[1], color[2]]
-#     np.write()
+def write_light_color_at(num, color, preset=0):
+    np[num + preset*8] = color
 
-# def set_light_color_at(num, color, preset=0):
-#     write_light_color_at(num, color, preset=preset)
-#     np.write()
+def light_excute():
+    np.write()
+
+def set_light_all_color(color):
+    for i in range(24):
+        np[i] = color
+    np.write()
+
+def set_light_color_at(num, color, preset=0):
+    write_light_color_at(num, color, preset=preset)
+    np.write()
 
 def set_light_bottom_left_color(color):
     for i in range(8):
@@ -63,47 +62,17 @@ def set_light_bottom_right_color(color):
     light_excute()
 
 def set_light_bottom_color(color):
-    # for i in range(8):
-    #     write_light_color_at(i+8*LIGHT_BOTTOM_LEFT, color)
-    # for i in range(8):
-    #     write_light_color_at(i+8*LIGHT_BOTTOM_RIGHT, color)
-    # Sync to PWM pins (map 0-255 to 0-65535)
-    pwm_r.duty_u16(int(color[0] / 255 * 65535))
-    pwm_g.duty_u16(int(color[1] / 255 * 65535))
-    pwm_b.duty_u16(int(color[2] / 255 * 65535))
-    # For Pin 19, use average brightness
-    avg = sum(color) / 3
-    pwm_19.duty_u16(int(avg / 255 * 65535))
+    for i in range(8):
+        write_light_color_at(i+8*LIGHT_BOTTOM_LEFT, color)
+    for i in range(8):
+        write_light_color_at(i+8*LIGHT_BOTTOM_RIGHT, color)
     light_excute()
-
-def set_turn_signal(direction):
-    """Restore the 'Turn Signal' effect using PWM headlamps."""
-    if direction == "left":
-        # Fast blink for left
-        for _ in range(3):
-            pwm_19.duty_u16(30000)
-            time.sleep(0.1)
-            pwm_19.duty_u16(0)
-            time.sleep(0.1)
-    elif direction == "right":
-        # Slow pulse for right
-        for _ in range(2):
-            pwm_19.duty_u16(30000)
-            time.sleep(0.2)
-            pwm_19.duty_u16(0)
-            time.sleep(0.2)
 
 def set_light_rear_color(color):
-    # for i in range(8):
-    #     write_light_color_at(i + 8*LIGHT_REAR, color)
+    for i in range(8):
+        write_light_color_at(i + 8*LIGHT_REAR, color)
     light_excute()
 
-def write_light_color_at(num, color, preset=0):
-    pass # np[num + preset*8] = color#[color[0], color[1], color[2]]
-
-def light_excute():
-    pass # np.write()
-    
 def set_light_off():
     set_light_all_color([0, 0, 0])
 
@@ -242,10 +211,8 @@ def move(dir, power=0):
     elif dir == "backward":
         set_motor_power_gradually(-power, -power, -power, -power)
     elif dir == "left":
-        set_turn_signal("left")
         set_motor_power_gradually(-power, power, -power, power)
     elif dir == "right":
-        set_turn_signal("right")
         set_motor_power_gradually(power, -power, power, -power)
     else:
         set_motor_power_gradually(0, 0, 0, 0)

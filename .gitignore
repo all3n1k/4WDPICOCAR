@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/*
+.idea/
+*.swp
+*.swo
+
+# Project build artifacts
+docs/build/*
+
+# Runtime / debug artifacts
+debug/latest_frame.jpg
+debug/latency.json
+debug/rssi_heatmap.json
+
+# MicroPython firmware binary (1MB+, get from upstream)
+ESP32_GENERIC-*.bin
+
+# Generated map visualisation (source-of-truth is apartment_map.py)
+apartment_map.png
+
+# Secrets (if you move WiFi creds out of app_control.py)
+examples/secrets.py

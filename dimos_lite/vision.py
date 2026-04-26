@@ -1,39 +1,59 @@
 import cv2
+import requests
 import time
 import threading
-import requests
-from dimos_lite.core import Module, StreamOut
+import numpy as np
+from ultralytics import YOLO
+import torch
 
+from dimos_lite.core import Module, StreamOut
 
 class VisionModule(Module):
     MAX_RECONNECT_DELAY = 10
 
-    def __init__(self, stream_url="http://192.168.1.216:81/stream"):
-        super().__init__("Vision")
+    def __init__(self, stream_url="http://192.168.4.1:81/stream"):
+        super().__init__("VisionV4")
         self.stream_url = stream_url
         self.color_image = StreamOut("color_image")
+        self.detections = StreamOut("detections") 
+        self._model = YOLO('yolov8n.pt')
+        self._device = "mps" if torch.backends.mps.is_available() else "cpu"
         self._base_url = stream_url.rsplit('/', 1)[0].replace(':81', '')
+        self.frame_count = 0
+        self._interrupt_stream = False 
 
-        # Latest-frame buffer: grab thread writes, publish thread reads
-        self._latest_frame = None
-        self._frame_lock = threading.Lock()
-        self._frame_event = threading.Event()
+    def start(self):
+        print(f"[{self.name}] Initializing {self.stream_url}")
+        self._set_led(50)
+        self._set_camera_params()
+
+        # Start the dedicated stream thread
+        stream_thread = threading.Thread(target=self._stream_loop, daemon=True)
+        stream_thread.start()
+
+    def _set_led(self, brightness=50):
+        """Set ESP32-CAM flash LED by temporarily cutting the stream."""
+        def _task():
+            # 1. Trigger the cut
+            self._interrupt_stream = True
+            time.sleep(0.15) # Quick wait for stream to close
+            
+            state_str = "on" if brightness > 0 else "off"
+            headers = {"Connection": "close"}
+            url = f"{self._base_url}/led?state={state_str}"
+            try:
+                requests.get(url, headers=headers, timeout=1.0)
+            except Exception:
+                pass
+            finally:
+                self._interrupt_stream = False
+        
+        threading.Thread(target=_task, daemon=True).start()
+        return True
 
     def _set_camera_params(self):
-        """Push low-latency + exposure-tuned settings to ESP32-CAM."""
-        params = [
-            ("framesize", 6),    # SVGA 800x600
-            ("quality", 15),     # Higher res needs slightly more compression for latency
-            ("brightness", 0),   # Neutral brightness
-            ("contrast", 0),     # Neutral contrast
-            ("aec2", 0),         # Standard AEC
-            ("ae_level", 0),     # Neutral auto-exposure
-            ("agc", 1),          # auto gain control on
-            ("gainceiling", 4),  # allow higher ISO in dark (0-6)
-            ("lenc", 1),         # lens correction (fix vignette)
-            ("awb", 1),          # auto white balance
-            ("awb_gain", 1),     # AWB gain enabled
-        ]
+        """Set resolution and flip for ESP32-CAM."""
+        params = [("framesize", 6), ("quality", 10)]
         for var, val in params:
             try:
                 url = f"{self._base_url}/control?var={var}&val={val}"
@@ -41,72 +61,63 @@ class VisionModule(Module):
             except Exception:
                 pass
 
-    def _set_led(self, brightness=64):
-        """Set ESP32-CAM flash LED. Lowered to 64/255 to prevent washout."""
-        try:
-            url = f"{self._base_url}/control?var=led_intensity&val={brightness}"
-            requests.get(url, timeout=2)
-            print(f"[{self.name}] LED set to {brightness}/255")
-        except Exception:
+    def _stream_loop(self):
+        """
+        Robust M-JPEG stream reader with 'Silence & Strike' support.
+        """
+        while True:
             try:
-                requests.get(f"{self._base_url}/led?intensity={brightness}", timeout=2)
-            except Exception:
-                print(f"[{self.name}] LED control not available")
+                print(f"[{self.name}] Opening HTTP stream...")
+                resp = requests.get(self.stream_url, stream=True, timeout=5)
+                if resp.status_code != 200:
+                    time.sleep(2)
+                    continue
 
-    def _grab_loop(self, cap):
-        """
-        High-speed grab thread: drains the OpenCV buffer as fast as possible
-        so the publish thread always gets the most recent frame, not a stale one.
-        """
-        while True:
-            ret = cap.grab()  # grab without decode — minimal CPU
-            if not ret:
-                self._frame_event.set()  # wake publish thread to reconnect
-                return
-            # Decode only when the publish thread is ready for a new frame
-            if not self._frame_event.is_set():
-                ret2, frame = cap.retrieve()
-                if ret2:
-                    with self._frame_lock:
-                        self._latest_frame = frame
-                    self._frame_event.set()
+                byte_buffer = b""
+                for chunk in resp.iter_content(chunk_size=512):
+                    if self._interrupt_stream:
+                        print(f"[{self.name}] INTERRUPTING stream for LED command...")
+                        resp.close()
+                        break
+                        
+                    byte_buffer += chunk
+                    a = byte_buffer.find(b'\xff\xd8') # JPEG Start
+                    b = byte_buffer.find(b'\xff\xd9') # JPEG End
 
-    def start(self):
-        print(f"[{self.name}] Connecting to {self.stream_url}")
-        self._set_led(100)
-        self._set_camera_params()
+                    if a != -1 and b != -1:
+                        jpg = byte_buffer[a:b+2]
+                        byte_buffer = byte_buffer[b+2:]
+                        buf = np.frombuffer(jpg, dtype=np.uint8)
 
-        reconnect_delay = 1
-        while True:
-            cap = cv2.VideoCapture(self.stream_url)
+                        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                        if frame is not None and frame.size > 0:
+                            frame = cv2.flip(frame, 0) # Vertical flip only (removes mirroring)
+                            
+                            # YOLOv8 Detection
+                            results = self._model(frame, stream=True, verbose=False, device=self._device)
+                            current_detections = []
+                            for r in results:
+                                for box in r.boxes:
+                                    cls = int(box.cls[0])
+                                    conf = float(box.conf[0])
+                                    xyxy = box.xyxy[0].tolist()
+                                    name = self._model.names[cls]
+                                    current_detections.append({
+                                        "name": name,
+                                        "label": name, # Support both 'name' and 'label' for agent compatibility
+                                        "conf": conf,
+                                        "confidence": conf,
+                                        "bbox": xyxy
+                                    })
 
-            # Disable OpenCV's internal frame buffer (keep only 1 frame)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-            if not cap.isOpened():
-                print(f"[{self.name}] Reconnecting in {reconnect_delay}s...")
-                time.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, self.MAX_RECONNECT_DELAY)
-                continue
-
-            reconnect_delay = 1
-            self._frame_event.clear()
-            self._latest_frame = None
-
-            # Start the dedicated grab thread
-            grab_thread = threading.Thread(target=self._grab_loop, args=(cap,), daemon=True)
-            grab_thread.start()
-
-            # Publish loop: pushes latest frame downstream at up to 30 FPS
-            while grab_thread.is_alive():
-                got = self._frame_event.wait(timeout=2.0)
-                if not got:
-                    break  # timeout → reconnect
-                self._frame_event.clear()
-                with self._frame_lock:
-                    frame = self._latest_frame
-                if frame is not None:
-                    self.color_image.publish(frame)
-
-            cap.release()
-            print(f"[{self.name}] Stream lost — reconnecting...")
+                            self.detections.publish(current_detections)
+                            self.color_image.publish(frame)
+                            self.frame_count += 1
+                
+                if self._interrupt_stream:
+                    time.sleep(0.1) # Minimum gap
+                    
+            except Exception as e:
+                if not self._interrupt_stream:
+                    print(f"[{self.name}] Stream error: {e}")
+                time.sleep(1)

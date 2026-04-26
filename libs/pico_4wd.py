@@ -13,6 +13,8 @@ right_rear  = Motor(11, 10, dir=1) # motor 4
 motors = [left_front, right_front, left_rear, right_rear]
 
 servo = Servo(18)
+servo20 = Servo(20)
+servo21 = Servo(21)
 speed = Speed(8, 9)
 
 # 24 WS2812 LEDs on GP19: indices 0-7 rear, 8-15 bottom-left, 16-23 bottom-right.

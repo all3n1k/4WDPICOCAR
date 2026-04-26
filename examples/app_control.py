@@ -1,5 +1,5 @@
 from ws import WS_Server
-from machine import I2C, Pin
+from machine import I2C, SoftI2C, Pin
 import json
 import time
 import pico_4wd as car
@@ -20,24 +20,52 @@ car.servo.set_angle(SERVO_OFFSET)
 # Stub returns 0.0 so the dashboard shows '---' until a real divider is wired.
 def read_battery_v(): return 0.0
 
-# ── MPU6050 IMU ──────────────────────────────────────────────
+# SoftI2C is used for both sensors. Hardware I2C peripheral on this MicroPython
+# build (v1.28.0) fails clock-stretched register reads with EIO on every freq;
+# SoftI2C handles stretching cleanly. Cost: ~1ms/tick total — sonar already
+# blocks for 10-25ms per read, so SoftI2C is not the bottleneck.
+
+# ── MPU6050 IMU on GP0=SDA, GP1=SCL ──────────────────────────────
 HAS_IMU = False
 imu = None
+imu_i2c = None
 try:
     from mpu6050 import MPU6050
-    i2c = I2C(1, sda=Pin(2), scl=Pin(3), freq=400000)
-    devs = i2c.scan()
+    imu_i2c = SoftI2C(sda=Pin(0, Pin.IN, Pin.PULL_UP),
+                      scl=Pin(1, Pin.IN, Pin.PULL_UP), freq=100000)
+    devs = imu_i2c.scan()
     if 0x68 in devs or 0x69 in devs:
         addr = 0x68 if 0x68 in devs else 0x69
-        imu = MPU6050(i2c, addr=addr)
-        print("MPU6050 at 0x%02x — calibrating (hold still)..." % addr)
+        imu = MPU6050(imu_i2c, addr=addr)
+        print("MPU6050 at 0x%02x on GP0/GP1 — calibrating (hold still)..." % addr)
         imu.calibrate()
         print("MPU6050 ready")
         HAS_IMU = True
     else:
-        print("MPU6050 not on I2C bus (found: %s)" % [hex(d) for d in devs])
+        print("MPU6050 not on GP0/GP1 (found: %s)" % [hex(d) for d in devs])
 except Exception as e:
     print("MPU6050 skip: %s" % e)
+
+# ── VL53L0X TOF Laser on GP2=SDA, GP3=SCL ────────────────────────
+HAS_TOF = False
+tof = None
+tof_i2c = None
+try:
+    from vl53l0x import VL53L0X
+    tof_i2c = SoftI2C(sda=Pin(2, Pin.IN, Pin.PULL_UP),
+                      scl=Pin(3, Pin.IN, Pin.PULL_UP), freq=100000)
+    devs_tof = tof_i2c.scan()
+    if 0x29 in devs_tof:
+        tof = VL53L0X(tof_i2c)
+        # Continuous mode: chip ranges back-to-back internally; read() polls
+        # the latest cached result in ~5-10ms instead of triggering+waiting 37ms.
+        tof.start(period=0)
+        print("VL53L0X TOF Laser ready on GP2/GP3 (continuous mode)")
+        HAS_TOF = True
+    else:
+        print("VL53L0X not on GP2/GP3 (found: %s)" % [hex(d) for d in devs_tof])
+except Exception as e:
+    print("VL53L0X skip: %s" % e)
 
 NAME = 'Pico4WD'
 WIFI_MODE = "sta"
@@ -56,6 +84,19 @@ timed_out = False
 led_prev = None
 current_radar_sweep = []
 tick_count = 0
+
+# Pan/Tilt head — updated by on_receive, applied every main-loop tick
+pan_angle = 0    # target angle -90..90, maps to GP20
+tilt_angle = 0   # target angle -90..90, maps to GP21
+pan_current = 0  # actual current angle (interpolated)
+tilt_current = 0 # actual current angle (interpolated)
+# Interpolation: 1° per 5ms tick = 200°/s. Roughly 4× the 50°/s the dashboard
+# arrow keys drive at, so we always catch up between sends but without the
+# whip-crack feel of the old 400°/s.
+SERVO_INTERP_STEP = 1
+# Deadband on incoming targets — small jitter from the brain or the WS pipe
+# would otherwise twitch the servo every tick.
+SERVO_DEADBAND = 2
 
 # ── Turn-signal state ──────────────────────────────────────────
 # Derived from incoming K commands in on_receive, ticked in the main loop.
@@ -102,7 +143,7 @@ def update_turn_signal(now_ms):
 
 
 def on_receive(data):
-    global last_cmd_ms, timed_out, servo_override, turn_signal, last_bot_color
+    global last_cmd_ms, timed_out, servo_override, turn_signal, last_bot_color, pan_angle, tilt_angle
     last_cmd_ms = time.ticks_ms()
     timed_out = False
 
@@ -144,6 +185,30 @@ def on_receive(data):
             else:
                 car.move(direction, power)
                 turn_signal = None
+        
+        # 4. Pan/Tilt Head Servos — store angle, main loop applies it.
+        # Deadband ignores micro-changes (LLM tune_parameters jitter, WS noise,
+        # arrow-key auto-repeat) so the servo doesn't twitch on every packet.
+        if 'S20' in data:
+            new_pan = max(-90, min(90, int(data['S20']) - 90))
+            if abs(new_pan - pan_angle) >= SERVO_DEADBAND:
+                pan_angle = new_pan
+        if 'S21' in data:
+            new_tilt = max(-90, min(90, int(data['S21']) - 90))
+            if abs(new_tilt - tilt_angle) >= SERVO_DEADBAND:
+                tilt_angle = new_tilt
+        
+        # 5. Dynamic Radar Config (for mapping)
+        if 'radar' in data:
+            cmd = data['radar']
+            if cmd == 'config':
+                if 'step' in data: global ANGLE_STEP; ANGLE_STEP = int(data['step'])
+                if 'poll' in data: global READ_EVERY_N; READ_EVERY_N = int(data['poll'])
+                print("Radar config: step=%d poll=%d" % (ANGLE_STEP, READ_EVERY_N))
+            elif cmd == 'stop':
+                servo_override = current_angle
+            elif cmd == 'sweep':
+                servo_override = None
     except Exception as e:
         print("pkt err:", e)
         car.stop()
@@ -170,15 +235,39 @@ while True:
         # Turn-signal LEDs (non-blocking)
         update_turn_signal(now_ms)
 
-        # Servo sweep or fixed angle
+        # Radar servo sweep or fixed angle
         target_angle = current_angle if servo_override is None else servo_override
         car.servo.set_angle(target_angle + SERVO_OFFSET)
 
-        # Sonar reading
+        # Pan/Tilt head — interpolate toward target each tick for smooth motion.
+        # Only push a fresh PWM update when the current angle actually changed;
+        # writing the same angle 200×/s caused observable micro-twitch on the
+        # SG90s.
+        if pan_current != pan_angle:
+            if pan_current < pan_angle:
+                pan_current = min(pan_current + SERVO_INTERP_STEP, pan_angle)
+            else:
+                pan_current = max(pan_current - SERVO_INTERP_STEP, pan_angle)
+            car.servo20.set_angle(pan_current)
+        if tilt_current != tilt_angle:
+            if tilt_current < tilt_angle:
+                tilt_current = min(tilt_current + SERVO_INTERP_STEP, tilt_angle)
+            else:
+                tilt_current = max(tilt_current - SERVO_INTERP_STEP, tilt_angle)
+            car.servo21.set_angle(tilt_current)
+
+        # Distance sensing (Laser + Sonar)
         tick_count += 1
         if tick_count >= READ_EVERY_N:
             tick_count = 0
-            dist = car.sonar.get_distance()
+            dist_sonar = car.sonar.get_distance()
+            dist_tof = tof.read() if HAS_TOF else None
+            
+            # Use laser if valid (up to 200cm), fallback to sonar
+            dist = dist_sonar
+            if dist_tof is not None and dist_tof < 200:
+                dist = dist_tof
+            
             if 0 < dist < 300:
                 ang = target_angle
                 found = False
@@ -189,6 +278,9 @@ while True:
                         break
                 if not found:
                     current_radar_sweep.append([ang, dist])
+            
+            # Add raw TOF to telemetry for dashboard debug
+            if HAS_TOF: ws.send_dict['T'] = dist_tof
 
         # Advance sweep angle only if not overridden
         if servo_override is None:
@@ -208,8 +300,8 @@ while True:
             except Exception as e:
                 print("imu err: %s" % e)
 
-        # Telemetry every N ticks
-        if tick_count % 5 == 0:
+        # Telemetry every 50ms (TICK_MS=5, so every 10 ticks)
+        if tick_count % 10 == 0:
             try:
                 ws.send_dict['B'] = car.speed()
                 ws.send_dict['C'] = car.speed.mileage

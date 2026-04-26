@@ -36,3 +36,14 @@ apartment_map.png
 
 # Secrets (if you move WiFi creds out of app_control.py)
 examples/secrets.py
+
+# Runtime-generated maps (rebuilt from sensors / survey UI each session)
+semantic_map.json
+constellation_map.json
+room_markers.json
+
+# YOLO weights — auto-downloaded by ultralytics on first run
+yolov8n.pt
+
+# Local scratch / test scripts (kept local, not part of public repo)
+scratch/

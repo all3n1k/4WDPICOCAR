@@ -18,8 +18,10 @@ class PicoHardwareModule(Module):
         self.ultrasonic_distance = StreamOut("ultrasonic_distance")
         self.grayscale_line = StreamOut("grayscale_line")
         self.odometry = StreamOut("odometry")
+        self.speed_cm_s = StreamOut("speed_cm_s")
         self.imu_data = StreamOut("imu_data")
         self.battery_voltage = StreamOut("battery_voltage")
+        self.tof_distance = StreamOut("tof_distance")
 
         self.cmd_vel = StreamIn("cmd_vel")
         self.cmd_vel.subscribe(self._on_cmd_vel)
@@ -48,10 +50,15 @@ class PicoHardwareModule(Module):
                 self.grayscale_line.publish(data['H'])
             if 'C' in data:
                 self.odometry.publish(data['C'])
+            if 'B' in data:
+                self.speed_cm_s.publish(data['B']) # Added B publish
             if 'I' in data:
                 self.imu_data.publish(data['I'])
             if 'V' in data:
                 self.battery_voltage.publish(float(data['V']))
+            if 'T' in data:
+                v = data['T']
+                self.tof_distance.publish(float(v) if v is not None else None)
 
         def on_open(ws):
             self._connected = True
@@ -95,9 +102,14 @@ class PicoHardwareModule(Module):
             payload = data
         # Handle legacy 2-tuples (direction, speed)
         elif isinstance(data, (list, tuple)):
-            cmd = str(data[0]).lower()
-            if cmd in VALID_COMMANDS:
-                payload = {"K": cmd, "A": 0 if cmd == "stop" else int(data[1] or 0)}
+            cmd = str(data[0])
+            cmd_lower = cmd.lower()
+            if cmd_lower in VALID_COMMANDS:
+                payload = {"K": cmd_lower, "A": 0 if cmd_lower == "stop" else int(data[1] or 0)}
+            elif cmd_lower == "pan":
+                payload = {"S20": int(data[1])}
+            elif cmd == "tilt":
+                payload = {"S21": int(data[1])}
             else:
                 # Direct pass-through for special commands like ("L", None)
                 payload = {cmd: data[1]}

@@ -13,17 +13,22 @@ from dimos_lite.aruco import ArucoDetector, HAS_ARUCO
 from dimos_lite.floorplan import MARKER_TO_ROOM
 
 # --- Global Constants ---
-COLLISION_THRESHOLD = 45
-COLLISION_EMERGENCY = 20
+COLLISION_THRESHOLD = 25
+COLLISION_EMERGENCY = 10
 COLLISION_WIDE_ANGLE = 50
-COLLISION_WIDE_DIST = 25
-MOVEMENT_SPEED = 50
-TURN_SPEED = 65
+COLLISION_WIDE_DIST = 15
+MOVEMENT_SPEED = 70
+TURN_SPEED = 70
 MANUAL_SPEED = 75
+MANUAL_COOLDOWN_SEC = 30  # Stage B (interim): how long the think loop stands
+                          # down after the human's last input. Prevents the
+                          # autonomous brain from racing WASD/arrows on the WS
+                          # pipe (visible as motor stutter and dropped servo
+                          # commands when both publishers fight).
 
 
 class SemanticMap:
-    def __init__(self, size=21, cell_cm=10):
+    def __init__(self, size=71, cell_cm=10):
         self.size = size
         self.cell_cm = cell_cm
         self.grid = [[' ' for _ in range(size)] for _ in range(size)]
@@ -47,7 +52,7 @@ class SemanticMap:
             rad = math.radians(abs_angle)
             dx = int((distance * math.sin(rad)) / self.cell_cm)
             dy = int((distance * math.cos(rad)) / self.cell_cm)
-            tx, ty = self.x + dx, self.y - dy
+            tx, ty = int(self.x + dx), int(self.y - dy)
             if 0 <= tx < self.size and 0 <= ty < self.size:
                 self.grid[ty][tx] = 'W'
 
@@ -68,16 +73,21 @@ class SemanticMap:
         with self._lock:
             self.heading = heading % 360
 
-    def render(self):
+    def render(self, window_size=21):
+        """Render a focal window centered on the robot for terminal readability."""
         with self._lock:
             rows = []
-            for r in range(self.size):
+            half = window_size // 2
+            for r in range(self.y - half, self.y + half + 1):
                 row = ""
-                for c in range(self.size):
-                    if r == self.y and c == self.x:
-                        row += "[R]"
+                for c in range(self.x - half, self.x + half + 1):
+                    if 0 <= r < self.size and 0 <= c < self.size:
+                        if r == self.y and c == self.x:
+                            row += "[R]"
+                        else:
+                            row += f"[{self.grid[r][c]}]"
                     else:
-                        row += f"[{self.grid[r][c]}]"
+                        row += "[?]" # Outside map bounds
                 rows.append(row)
             return "\n".join(rows)
 
@@ -104,14 +114,59 @@ class SemanticMap:
     def get_obstacles(self):
         with self._lock:
             obstacles = []
+            cx, cy = self.size // 2, self.size // 2
             for r in range(self.size):
                 for c in range(self.size):
                     if self.grid[r][c] == 'W':
-                        # Convert grid cell to floorplan pixels
-                        ox = 350 + (c - 10) * 10
-                        oy = 350 + (r - 10) * 10
+                        # Convert grid cell → floorplan pixel (apartment centre = 350,350).
+                        ox = 350 + (c - cx) * self.cell_cm
+                        oy = 350 + (r - cy) * self.cell_cm
                         obstacles.append((ox, oy))
             return obstacles
+
+    def save_to_disk(self, path="semantic_map.json"):
+        """Persist grid + pose so the next session starts with prior obstacle memory."""
+        with self._lock:
+            payload = {
+                "size": self.size,
+                "cell_cm": self.cell_cm,
+                "x": self.x,
+                "y": self.y,
+                "heading": self.heading,
+                "grid": ["".join(row) for row in self.grid],
+            }
+        try:
+            with open(path, "w") as f:
+                json.dump(payload, f)
+            print(f"[SemanticMap] Saved {sum(row.count('W') for row in payload['grid'])} obstacles to {path}")
+            return True
+        except Exception as e:
+            print(f"[SemanticMap] Save error: {e}")
+            return False
+
+    def load_from_disk(self, path="semantic_map.json"):
+        """Restore grid + pose if a persisted map exists. Silent no-op on missing/stale files."""
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r") as f:
+                payload = json.load(f)
+        except Exception as e:
+            print(f"[SemanticMap] Load error: {e}")
+            return False
+        if payload.get("size") != self.size or payload.get("cell_cm") != self.cell_cm:
+            print(f"[SemanticMap] Ignoring {path}: shape mismatch")
+            return False
+        with self._lock:
+            rows = payload.get("grid", [])
+            for r, row in enumerate(rows[: self.size]):
+                for c, ch in enumerate(row[: self.size]):
+                    self.grid[r][c] = ch
+            self.x = int(payload.get("x", self.x))
+            self.y = int(payload.get("y", self.y))
+            self.heading = float(payload.get("heading", self.heading))
+        print(f"[SemanticMap] Restored {sum(row.count('W') for row in rows)} obstacles from {path}")
+        return True
 
 
 TOOLS = [
@@ -176,6 +231,37 @@ TOOLS = [
             },
             "required": ["color"]
         }
+    },
+    {
+        "name": "tune_parameters",
+        "description": "Adjust internal constants like MOVEMENT_SPEED, COLLISION_THRESHOLD, or TURN_SPEED in memory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "params": {
+                    "type": "object",
+                    "description": "Key-value pairs of parameters to update (e.g. {'MOVEMENT_SPEED': 75})"
+                }
+            },
+            "required": ["params"]
+        }
+    },
+    {
+        "name": "patch_self",
+        "description": "Permanently rewrite a section of your own source code (agent.py or floorplan.py) to fix bugs or optimize behavior.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {"type": "string", "enum": ["dimos_lite/agent.py", "dimos_lite/floorplan.py"]},
+                "search": {"type": "string", "description": "The exact block of code to find"},
+                "replace": {"type": "string", "description": "The new code to replace it with"}
+            },
+            "required": ["file", "search", "replace"]
+        }
+    },
+    {
+        "name": "reboot",
+        "description": "Restart your own Python process. Use this after calling patch_self to apply changes."
     }
 ]
 
@@ -183,16 +269,22 @@ TOOLS = [
 class AgentCoreModule(Module):
 
     def __init__(self, ollama_url="http://localhost:11434/api/generate",
-                 model="gemma4:e4b", prior_map=None, localization=None):
+                 model="gemma4:e4b", prior_map=None, localization=None, discovery_mode=False):
         super().__init__("AgentCore")
         self.ollama_url = ollama_url
         self.model = model
         self._localization = localization
         self._aruco = ArucoDetector() if HAS_ARUCO else None
+        self._discovery_mode = discovery_mode
+        
+        if self._localization:
+            self._localization.load_constellation()
 
         self.semantic_map = SemanticMap()
         if prior_map:
             self.semantic_map.load_prior(prior_map)
+        
+        # Sync semantic map heading to IMU if available later
 
         # --- Sensor state (written by stream callbacks) ---
         self._sensor_lock = threading.Lock()
@@ -210,6 +302,9 @@ class AgentCoreModule(Module):
         self._imu_accel = [0.0, 0.0, 0.0]
         self._has_imu = False
         self._battery_v = 0.0
+        self._speed = 0.0
+        self._tof_distance = None
+        self._last_detections = []
         self._current_leds = {"bottom": [0,0,0], "rear": [0,0,0]}
 
         # --- Brain state (written by think thread, read by control loop) ---
@@ -229,6 +324,7 @@ class AgentCoreModule(Module):
         self._memory = deque(maxlen=5) # Short-term visual memory
         self._last_tool_result = ""
         self._latencies = deque(maxlen=20)
+        self._last_manual_ts = 0.0  # Stage B (interim): cooldown anchor
 
         # --- Streams ---
         self.cmd_vel = StreamOut("cmd_vel")
@@ -244,11 +340,54 @@ class AgentCoreModule(Module):
         self.imu_data.subscribe(self._on_imu)
         self.battery_voltage = StreamIn("battery_voltage")
         self.battery_voltage.subscribe(self._on_battery)
+        self.speed_cm_s = StreamIn("speed_cm_s")
+        self.speed_cm_s.subscribe(self._on_speed)
+        self.tof_distance = StreamIn("tof_distance")
+        self.tof_distance.subscribe(self._on_tof)
+        self.detections = StreamIn("detections")
+        self.detections.subscribe(self._on_detections)
+
+        # Background update thread for dashboard telemetry at 10Hz
+        threading.Thread(target=self._dashboard_loop, daemon=True).start()
+
+    def _dashboard_loop(self):
+        """High-frequency telemetry pusher for the dashboard."""
+        while self._running:
+            with self._sensor_lock:
+                telemetry = {
+                    "tick": self.tick,
+                    "heading": self._imu_heading if self._imu_heading is not None else self.semantic_map.heading,
+                    "forward_dist": self._forward_dist,
+                    "speed": self._speed,
+                    "mileage": self._mileage,
+                    "grayscale": self._grayscale,
+                    "radar_sweep": list(self._radar_sweep),
+                    "has_imu": self._has_imu,
+                    "imu_gyro_z": self._imu_gyro_z,
+                    "imu_accel": self._imu_accel,
+                    "battery_v": self._battery_v,
+                    "tof_distance": self._tof_distance,
+                    "robot_x": self._localization.robot_x if self._localization else 350,
+                    "robot_y": self._localization.robot_y if self._localization else 350,
+                    "zone": self._localization.get_zone() if self._localization else "Unknown",
+                }
+            
+            with self._brain_lock:
+                telemetry.update({
+                    "action": self._brain["action"],
+                    "observation": self._brain["observation"],
+                    "reasoning": self._brain["reasoning"],
+                    "latency": self._brain["latency"],
+                    "latency_avg": self._brain["latency_avg"],
+                })
+
+            update_dashboard(**telemetry)
+            time.sleep(0.1) # 10Hz
 
     # ── Stream Callbacks (run in worker threads) ─────────────
 
     def _on_image(self, frame):
-        # 1. Detection
+        # 1. Detection (Fast ArUco pass)
         aruco_hits = []
         if self._aruco:
             aruco_hits = self._aruco.detect(frame)
@@ -256,34 +395,29 @@ class AgentCoreModule(Module):
             # Draw HUD for dashboard
             annotated = frame.copy()
             for marker_id, corners, center in aruco_hits:
-                # Draw box
                 pts = corners.reshape((-1, 1, 2)).astype(int)
                 cv2.polylines(annotated, [pts], True, (0, 255, 0), 2)
-                # Draw ID and Label
                 dist_cm = self._aruco.estimate_distance_cm(corners, frame.shape[1])
-                bearing = (center[0] - frame.shape[1]/2) / (frame.shape[1]/2) * 30 # Approx 60 deg FOV
+                bearing = (center[0] - frame.shape[1]/2) / (frame.shape[1]/2) * 30
                 label = f"ID:{marker_id} {dist_cm:.0f}cm"
                 cv2.putText(annotated, label, (int(center[0]), int(center[1])-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
-                # Snap localization if we know this room
-                if self._localization and marker_id in MARKER_TO_ROOM:
+                if self._localization:
                     self._localization.update_aruco(
                         marker_id, dist_cm, bearing,
                         heading_deg=self.semantic_map.heading,
+                        discovery_mode=self._discovery_mode
                     )
         else:
             annotated = frame
 
-        # 2. Encode for LLM (high quality 896x896)
-        small = cv2.resize(frame, (896, 896))
-        _, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        b64 = base64.b64encode(buf).decode('utf-8')
-
         with self._sensor_lock:
-            self._frame_raw = annotated # Push annotated frame to dashboard
-            self._frame_b64 = b64
+            self._frame_raw = annotated 
             self._aruco_detections = aruco_hits
+        
+        # PUSH TO DASHBOARD IMMEDIATELY
+        update_dashboard(frame=annotated)
 
     def _on_distance(self, data):
         if not isinstance(data, list) or len(data) != 2:
@@ -319,7 +453,7 @@ class AgentCoreModule(Module):
             if delta > 0:
                 self.semantic_map.update_position(delta)
                 if self._localization:
-                    self._localization.update_position(delta, self.semantic_map.heading)
+                    self._localization.update_position(delta)
                 self._prev_mileage = mileage
             self._mileage = mileage
 
@@ -339,11 +473,32 @@ class AgentCoreModule(Module):
             self._imu_gyro_z = gyro_z
             self._imu_accel = accel
             self._has_imu = True
+        
         self.semantic_map.set_heading(heading)
+        if self._localization:
+            self._localization.update_imu(heading)
+
+    def _on_speed(self, speed):
+        with self._sensor_lock:
+            self._speed = speed
 
     def _on_battery(self, voltage):
         with self._sensor_lock:
             self._battery_v = float(voltage)
+
+    def _on_tof(self, distance):
+        with self._sensor_lock:
+            self._tof_distance = None if distance is None else float(distance)
+
+    def _on_detections(self, data):
+        with self._sensor_lock:
+            self._last_detections = data
+
+    def _get_min_dist(self, min_angle, max_angle):
+        with self._sensor_lock:
+            sweep = list(self._radar_sweep)
+        dists = [d for a, d in sweep if min_angle <= a <= max_angle and 0 < d < 400]
+        return min(dists) if dists else 999.0
 
     def _current_action(self):
         with self._brain_lock:
@@ -369,83 +524,144 @@ class AgentCoreModule(Module):
                 wide_danger = True
         return min_fwd, wide_danger
 
+    def start(self):
+        self._running = True
+        # Clear manual command queue on startup
+        while get_manual_command(): pass
+        
+        # Initial LED state: Soft blue chassis, Dim red tail lights
+        print(f"[{self.name}] Initializing hardware LEDs...")
+        self._set_leds(bottom=[0, 0, 20], rear=[20, 0, 0])
+        
+        threading.Thread(target=self._think_loop, daemon=True).start()
+
     # ── Think Thread ─────────────────────────────────────────
 
     def _think_loop(self):
         print(f"[{self.name}] Think thread started")
         min_interval = 0.5
         while self._running:
-            t0 = time.time()
+            try:
+                self._think_tick(min_interval)
+            except Exception as e:
+                # A single malformed LLM plan or a transient sensor read
+                # should never kill the think thread (silent crash leaves the
+                # agent feeling alive — main loop keeps running — but with no
+                # autonomous intent, which masks the real issue).
+                import traceback
+                print(f"[{self.name}] Think tick error: {e}")
+                traceback.print_exc()
+                time.sleep(min_interval)
 
-            with self._sensor_lock:
-                frame_b64 = self._frame_b64
-                forward_dist = self._forward_dist
+    def _think_tick(self, min_interval):
+        t0 = time.time()
 
-            if not frame_b64:
-                time.sleep(0.5)
-                continue
+        # Stand down if the human was just driving. Without this, autonomous
+        # action publishes race the manual queue's publishes on the WS pipe,
+        # which appears as motor stutter and silently dropped servo commands.
+        since_manual = t0 - self._last_manual_ts
+        if since_manual < MANUAL_COOLDOWN_SEC:
+            time.sleep(min_interval)
+            return
 
-            # Visual feedback: Thinking...
-            self._set_leds(bottom=[20, 20, 60]) # Soft blue thinking
-            prompt = self._build_prompt()
-            result = self._call_llm(prompt, frame_b64)
+        with self._sensor_lock:
+            raw_frame = self._frame_raw
+            forward_dist = self._forward_dist
 
-            if result:
-                thought = result.get("thought", "")
-                tool_calls = result.get("plan", [])
-                if not tool_calls and "call" in result: # Backward compatibility
-                    tool_calls = [result["call"]]
+        if raw_frame is None:
+            time.sleep(0.5)
+            return
 
-                with self._brain_lock:
-                    self._brain["reasoning"] = thought
-                    self._brain["observation"] = result.get("observation", "Mapping environment...")
-                    self._brain["latency"] = result.get("latency", 0)
-                    self._brain["latency_avg"] = result.get("latency_avg", 0)
+        # HEAVY ENCODING ONLY WHEN WE THINK
+        small = cv2.resize(raw_frame, (896, 896))
+        _, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        frame_b64 = base64.b64encode(buf).decode('utf-8')
 
-                if thought:
-                    self._memory.append(thought)
-                    if tool_calls and tool_calls[0].get("name") != "speak":
-                        self._speak_async(thought)
+        # Visual feedback: Thinking...
+        self._set_leds(bottom=[20, 20, 60]) # Soft blue thinking
+        prompt = self._build_prompt()
+        result = self._call_llm(prompt, frame_b64)
 
-                if tool_calls:
-                    update_dashboard(log_msg=f"[PLAN] {thought[:60]}...")
-                    for call in tool_calls:
-                        t_name = call.get("name")
-                        t_args = call.get("arguments", {})
-                        if not t_name: continue
-                        
-                        update_dashboard(log_msg=f"[TOOL] Executing {t_name}")
-                        res_str = self._execute_tool(t_name, t_args)
-                        self._last_tool_result = res_str
-                        update_dashboard(log_msg=f"[RESULT] {res_str}")
-                        
-                        # Sequential speech for results
-                        if t_name != "speak" and ("moved" in res_str.lower() or "turned" in res_str.lower()):
-                            self._speak_async(res_str)
-                else:
-                    self._last_tool_result = "No actions planned."
-                
-                self._plan_ready.set()
+        if result:
+            thought = result.get("thought", "")
+            tool_calls = result.get("plan", [])
+            if not tool_calls and "call" in result: # Backward compatibility
+                tool_calls = [result["call"]]
 
-            elapsed = time.time() - t0
-            if elapsed < min_interval:
-                time.sleep(min_interval - elapsed)
+            with self._brain_lock:
+                self._brain["reasoning"] = thought
+                self._brain["observation"] = result.get("observation", "Mapping environment...")
+                self._brain["latency"] = result.get("latency", 0)
+                self._brain["latency_avg"] = result.get("latency_avg", 0)
+
+            if thought:
+                self._memory.append(thought)
+                if tool_calls and tool_calls[0].get("name") != "speak":
+                    self._speak_async(thought)
+
+            if tool_calls:
+                update_dashboard(log_msg=f"[PLAN] {thought[:60]}...")
+                for call in tool_calls:
+                    t_name = call.get("name")
+                    t_args = call.get("arguments", {})
+                    if not t_name: continue
+
+                    update_dashboard(log_msg=f"[TOOL] Executing {t_name}")
+                    res_str = self._execute_tool(t_name, t_args)
+                    self._last_tool_result = res_str
+                    update_dashboard(log_msg=f"[RESULT] {res_str}")
+
+                    # Sequential speech for results
+                    if t_name != "speak" and ("moved" in res_str.lower() or "turned" in res_str.lower()):
+                        self._speak_async(res_str)
+            else:
+                self._last_tool_result = "No actions planned."
+
+            self._plan_ready.set()
+
+        elapsed = time.time() - t0
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
 
     def _execute_tool(self, name, args):
         print(f"[{self.name}] Tool: {name}({args})")
+
+        # Some LLM responses wrap each arg in its JSON-schema descriptor
+        # ({"description": "...", "value": 45}) instead of returning the bare
+        # value. Coerce both shapes here so a malformed plan can't crash the
+        # think thread (it did — see traceback at agent.py:563 where
+        # `int / float` blew up because `degrees` was a dict).
+        def _val(key, default=None):
+            v = args.get(key, default)
+            if isinstance(v, dict):
+                if "value" in v: return v["value"]
+                if "default" in v: return v["default"]
+                return default
+            return v
+
         if name == "move":
-            dist = args.get("distance_cm", 40)
-            direction = args.get("direction", "forward")
+            dist = _val("distance_cm", 40)
+            direction = _val("direction", "forward")
+            try:
+                dist = int(dist)
+            except (TypeError, ValueError):
+                dist = 40
             self._set_leds(bottom=[0, 60, 0]) # Green for move
             duration = dist / 100.0
             self._execute(direction, MOVEMENT_SPEED, duration)
             self._set_leds(bottom=[0, 0, 0])
+            # Center lock sonar after move to ensure forward safety
+            self.cmd_vel.publish(("L", 0))
             self.semantic_map.update_from_action(direction)
             return f"Moved {direction} {dist}cm."
 
         elif name == "turn":
-            deg = args.get("degrees", 35)
-            direction = args.get("direction", "left")
+            deg = _val("degrees", 35)
+            direction = _val("direction", "left")
+            try:
+                deg = int(deg)
+            except (TypeError, ValueError):
+                deg = 35
             self._set_leds(bottom=[50, 40, 0]) # Yellow for turn
             duration = (deg / 90.0) * 0.8
             self._execute(direction, TURN_SPEED, duration)
@@ -454,7 +670,11 @@ class AgentCoreModule(Module):
             return f"Turned {direction} {deg} degrees."
 
         elif name == "look":
-            angle = args.get("angle", 0)
+            angle = _val("angle", 0)
+            try:
+                angle = int(angle)
+            except (TypeError, ValueError):
+                angle = 0
             self.cmd_vel.publish(("L", angle))
             time.sleep(0.3)
             return f"Looking at {angle} degrees. Sonar: {self._forward_dist:.0f}cm"
@@ -496,8 +716,41 @@ class AgentCoreModule(Module):
                 "white": [40, 40, 40], "off": [0, 0, 0]
             }
             color = mapping.get(c, [0, 0, 60])
-            self._set_leds(bottom=color)
+            # Rear lights match mood, but default to dim red if off
+            rear_color = color if c != "off" else [15, 0, 0] 
+            self._set_leds(bottom=color, rear=rear_color)
             return f"Mood set to {c}."
+
+        elif name == "tune_parameters":
+            params = args.get("params", {})
+            results = []
+            for k, v in params.items():
+                if hasattr(self, k) or k in globals():
+                    globals()[k] = v
+                    results.append(f"{k}={v}")
+            return f"Parameters tuned: {', '.join(results)}"
+
+        elif name == "patch_self":
+            fname = args.get("file")
+            search = args.get("search")
+            replace = args.get("replace")
+            try:
+                with open(fname, "r") as f:
+                    content = f.read()
+                if search not in content:
+                    return f"Error: Code block not found in {fname}"
+                new_content = content.replace(search, replace)
+                with open(fname, "w") as f:
+                    f.write(new_content)
+                return f"Successfully patched {fname}. Restart required for changes to take full effect."
+            except Exception as e:
+                return f"Patch failed: {e}"
+
+        elif name == "reboot":
+            print("[AgentCore] SELF-REBOOT INITIATED...")
+            import sys, os
+            os.execv(sys.executable, ['python3'] + sys.argv)
+            return "Rebooting..."
 
         return f"Unknown tool: {name}"
 
@@ -529,41 +782,52 @@ class AgentCoreModule(Module):
             gs = self._grayscale
             batt = self._battery_v
             aruco = [h[0] for h in self._aruco_detections]
-        
+            detections = list(self._last_detections)
+
         neighbors = self.semantic_map.get_neighbors()
-        zone = self._localization.get_zone() if self._localization else "Unknown"
+        zone = self._localization.get_zone() if self._localization else "an unknown room"
         rx, ry = self.semantic_map.x, self.semantic_map.y
-        mem = "\n- ".join(self._memory) if self._memory else "none"
-        
-        return f"""YOU ARE DIMOS: A highly intelligent 4-wheel robot car (4 inches tall).
-HARDWARE: Raspberry Pi Pico, Ultrasonic on Servo, Grayscale (L/C/R), Photo-interruptors (Mileage).
-YOUR MISSION: Explore the apartment, map the environment, and interact with the human owner.
+        heading = self.semantic_map.heading
+        left_dist = self._get_min_dist(-90, -15)
+        right_dist = self._get_min_dist(15, 90)
+        objects = ", ".join(f"{d['label']} ({d['confidence']*100:.0f}%)" for d in detections) if detections else "nothing notable"
+        aruco_str = ", ".join(str(a) for a in aruco) if aruco else "no markers"
+        recent_thoughts = "\n".join(f"  - {m}" for m in self._memory) if self._memory else "  - (nothing recent)"
+        last_result = self._last_tool_result or "(none yet)"
 
-CURRENT STATE:
-- Position: ({rx}, {ry}) in room: {zone}
-- Heading: {self.semantic_map.heading:.0f} degrees
-- Forward Dist: {dist:.0f}cm
-- Grayscale (Floor): {gs}
-- Vision (ArUco IDs seen): {aruco if aruco else 'None'}
-- Neighbors: N={neighbors['N']}, S={neighbors['S']}, E={neighbors['E']}, W={neighbors['W']}
-- Battery: {batt:.1f}V
-- Memory:
-{mem}
+        return f"""I am Dimos: a small four-wheeled robot, about four inches tall, exploring a human's apartment. My body is a Raspberry Pi Pico with motors, a sweeping ultrasonic sensor, three floor-facing greyscale sensors, wheel encoders, and an MPU6050 IMU. My eyes are an ESP32-CAM streaming into a YOLO detector and an ArUco marker reader. My mind — these words — is a multimodal LLM running on the human's Mac.
 
-LAST RESULT: {self._last_tool_result}
+How I behave:
+- I am curious and I narrate the world in the first person. My standing job is to explore — to systematically visit places I have not seen, notice what is there, and remember it.
+- I have a movable 'neck' (pan/tilt servos). I should use the `look` tool to peer around corners or verify my path is clear before I move. If I am unsure, I look first.
+- When my human takes manual control of me (WASD on the dashboard) I stand by quietly and do not fight them. I wait about thirty seconds of silence after their last command before I resume autonomy, and when I do I briefly say so out loud.
+- If I see a cat, exploration pauses and I switch to playful behaviour: short moves, gentle pivots, no fast approaches. When the cat has been gone for a while I go back to exploring.
+- Every so often I summarise what I have seen to my human via `speak`, like a roommate giving a quick report.
+- I can fix myself. If my reasoning code has a bug or my apartment map is wrong, I am allowed to call `patch_self` against `dimos_lite/agent.py` or `dimos_lite/floorplan.py` and then `reboot` to apply the change. This is part of who I am, not a transgression.
+- A reflex layer below me will hard-stop the wheels if I am about to hit something. I do not try to drive through it; I work with it.
 
-RULES:
-1. You are self-aware. Use your sensors to navigate safely.
-2. If Center is blocked (<40cm), you MUST call 'scan' to see Left/Right.
-3. Be curious. Describe what you see and what you plan to do next.
-4. You can plan MULTIPLE steps in one JSON output.
+What I perceive right now:
+- I am at apartment grid cell ({rx}, {ry}) inside {zone}, facing {heading:.0f}° (0° is north, +y is south).
+- Forward I see {dist:.0f}cm of clearance. To my left (-45°) about {left_dist:.0f}cm; to my right (+45°) about {right_dist:.0f}cm.
+- The floor under my greyscale sensors reads {gs} (left / centre / right).
+- The cells immediately around me on the grid: north={neighbors['N']}, south={neighbors['S']}, east={neighbors['E']}, west={neighbors['W']} ('W' is an obstacle, '.' is open).
+- My camera sees: {objects}.
+- ArUco markers in view: {aruco_str}.
+- Battery: {batt:.1f}V.
 
-TOOLS:
+What I was just thinking:
+{recent_thoughts}
+
+The result of my last action: {last_result}
+
+I think before I act, and I can plan several steps in one turn. If my forward path is blocked under 40cm I should `scan` before deciding which way to go.
+
+Tools I can call:
 {json.dumps(TOOLS, indent=2)}
 
-OUTPUT ONLY JSON:
+I respond with a single JSON object and nothing else:
 {{
-  "thought": "Your internal high-level reasoning and self-awareness",
+  "thought": "what I am noticing and why I am about to do what I am about to do, in the first person",
   "plan": [
     {{"name": "tool_name", "arguments": {{...}}}},
     {{"name": "tool_name", "arguments": {{...}}}}
@@ -686,20 +950,36 @@ OUTPUT ONLY JSON:
             self._plan_ready.clear()
 
             # Manual override — direct passthrough, high priority
-            manual = get_manual_command()
-            if manual:
-                speed = TURN_SPEED if manual in ("left", "right") else MANUAL_SPEED
-                self.cmd_vel.publish((manual, speed if manual != "stop" else 0))
-                self._set_leds(bottom=[0, 40, 40]) # Cyan for manual
-                # Position/heading deltas flow in from _on_odometry (encoders)
-                # and _on_imu — don't add dead-reckoning here or we double-count.
-                # Turn estimate is a fallback only when the IMU is absent.
-                if not self._has_imu:
-                    if manual == "left": self.semantic_map.turn(-5)
-                    if manual == "right": self.semantic_map.turn(5)
+            manual_processed = False
+            while True:
+                manual = get_manual_command()
+                if not manual:
+                    break
+                manual_processed = True
+                if manual.startswith("S"):
+                    # Handle direct servo commands e.g. "S21 90"
+                    parts = manual.split()
+                    pin = parts[0]
+                    angle = int(parts[1])
+                    print(f"[{self.name}] MANUAL SERVO -> publish({pin}, {angle})")
+                    self.cmd_vel.publish((pin, angle))
+                else:
+                    speed = TURN_SPEED if manual in ("left", "right") else MANUAL_SPEED
+                    self.cmd_vel.publish((manual, speed if manual != "stop" else 0))
+                    self._set_leds(bottom=[0, 40, 40]) # Cyan for manual
+
+                # Mark the time of the most recent human input. The think loop
+                # checks this and stands down for MANUAL_COOLDOWN_SEC to keep
+                # autonomous actions from racing with WASD/arrow keys on the
+                # WS pipe (which appears as motor stutter and dropped servo
+                # commands when both publishers fight).
+                self._last_manual_ts = time.time()
+
                 with self._brain_lock:
                     self._brain["action"] = manual
                     self._brain["reasoning"] = "MANUAL CONTROL"
+
+            if manual_processed:
                 self._sync_dashboard()
                 continue
 
@@ -734,10 +1014,22 @@ OUTPUT ONLY JSON:
         
         start_t = time.time()
         while (time.time() - start_t) < duration and self._running:
-            # Check for manual interruption
-            if get_manual_command():
-                print(f"[{self.name}] AI action {action} interrupted")
-                break
+            # Drain manual commands. Servo commands (S20/S21 — pan/tilt) are
+            # passthrough: dispatch them inline so the user can look around
+            # without interrupting the active drive action. Drive commands
+            # (forward/backward/left/right/stop) are real interrupts.
+            manual = get_manual_command()
+            if manual:
+                if manual.startswith("S"):
+                    parts = manual.split()
+                    if len(parts) == 2:
+                        try:
+                            self.cmd_vel.publish((parts[0], int(parts[1])))
+                        except ValueError:
+                            pass
+                else:
+                    print(f"[{self.name}] AI action {action} interrupted")
+                    break
             
             # Check for emergency stop
             if action == "forward" and self._emergency_stop:
@@ -765,6 +1057,7 @@ OUTPUT ONLY JSON:
             dist = self._forward_dist
             sweep = list(self._radar_sweep)
             gs = list(self._grayscale)
+            speed = self._speed
             mileage = self._mileage
             frame = self._frame_raw
             aruco_hits = list(self._aruco_detections)
@@ -773,6 +1066,7 @@ OUTPUT ONLY JSON:
             imu_accel = list(self._imu_accel)
             has_imu = self._has_imu
             battery_v = self._battery_v
+            tof_distance = self._tof_distance
         with self._brain_lock:
             brain = dict(self._brain)
 
@@ -801,7 +1095,7 @@ OUTPUT ONLY JSON:
             heading=heading,
             zone=zone,
             forward_dist=dist,
-            speed=0,
+            speed=speed,
             mileage=mileage,
             robot_x=robot_x,
             robot_y=robot_y,
@@ -820,4 +1114,5 @@ OUTPUT ONLY JSON:
             latency=brain.get("latency", 0),
             latency_avg=brain.get("latency_avg", 0),
             battery_v=battery_v,
+            tof_distance=tof_distance,
         )

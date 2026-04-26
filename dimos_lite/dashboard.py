@@ -11,16 +11,18 @@ PORT = 8080
 class DashboardState:
     def __init__(self):
         self.latest_frame = None
+        self.manual_cmds = []
         self.map_data = ""
         self.logs = []
         self.lock = threading.Lock()
-        self.manual_cmd = None
+        self.vision_module = None
         self.position_override = None
         self.telemetry = {
             "tick": 0,
             "heading": 0,
             "zone": "Unknown",
             "forward_dist": 999,
+            "tof_distance": None,
             "speed": 0,
             "mileage": 0,
             "action": "stop",
@@ -44,7 +46,43 @@ class DashboardState:
             "obstacles": [],
         }
         self.marker_positions = {}
+        # Marker survey (M0): in-progress pins keyed by marker ID.
+        # Wall markers (0-4): {x, y, facing_deg, type: "wall"}
+        # Floor markers (10+): {x, y, type: "floor"}
+        self.survey_pins = {}
+        self._load_survey_from_disk()
         self.start_time = time.time()
+
+    def _load_survey_from_disk(self):
+        """Restore the survey state from room_markers.json + constellation_map.json so a
+        previous session's pins are visible on the dashboard without re-pinning."""
+        try:
+            if os.path.exists("room_markers.json"):
+                with open("room_markers.json") as f:
+                    for mid_str, entry in json.load(f).items():
+                        self.survey_pins[int(mid_str)] = {
+                            "x": float(entry["x"]),
+                            "y": float(entry["y"]),
+                            "facing_deg": float(entry.get("facing_deg", 0)),
+                            "type": "wall",
+                        }
+        except Exception as e:
+            print(f"[Dashboard] room_markers.json load error: {e}")
+        try:
+            if os.path.exists("constellation_map.json"):
+                with open("constellation_map.json") as f:
+                    for mid_str, pos in json.load(f).items():
+                        mid = int(mid_str)
+                        if mid not in self.survey_pins:
+                            self.survey_pins[mid] = {
+                                "x": float(pos[0]),
+                                "y": float(pos[1]),
+                                "type": "floor",
+                            }
+        except Exception as e:
+            print(f"[Dashboard] constellation_map.json load error: {e}")
+        if self.survey_pins:
+            print(f"[Dashboard] Loaded {len(self.survey_pins)} surveyed markers")
 
 state = DashboardState()
 
@@ -66,7 +104,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode())
             cmd = body.get('command')
             with state.lock:
-                state.manual_cmd = cmd
+                state.manual_cmds.append(cmd)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -95,6 +133,97 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"ok": True, "x": x, "y": y}).encode())
+        elif self.path == '/api/pin_marker':
+            length = int(self.headers['Content-Length'])
+            body = json.loads(self.rfile.read(length).decode())
+            mid = int(body.get('id'))
+            mtype = body.get('type', 'floor')
+            entry = {
+                "x": float(body.get('x', 0)),
+                "y": float(body.get('y', 0)),
+                "type": mtype,
+            }
+            if mtype == "wall":
+                entry["facing_deg"] = float(body.get('facing_deg', 0))
+            with state.lock:
+                state.survey_pins[mid] = entry
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True, "count": len(state.survey_pins)}).encode())
+        elif self.path == '/api/unpin_marker':
+            length = int(self.headers['Content-Length'])
+            body = json.loads(self.rfile.read(length).decode())
+            mid = int(body.get('id'))
+            with state.lock:
+                state.survey_pins.pop(mid, None)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True, "count": len(state.survey_pins)}).encode())
+        elif self.path == '/api/save_survey':
+            with state.lock:
+                pins = dict(state.survey_pins)
+            room_markers, constellation = {}, {}
+            for mid, entry in pins.items():
+                if entry.get("type") == "wall":
+                    room_markers[str(mid)] = {
+                        "x": entry["x"], "y": entry["y"],
+                        "facing_deg": entry.get("facing_deg", 0),
+                    }
+                else:
+                    constellation[str(mid)] = [entry["x"], entry["y"]]
+            ok = True
+            try:
+                with open("room_markers.json", "w") as f:
+                    json.dump(room_markers, f, indent=2)
+                with open("constellation_map.json", "w") as f:
+                    json.dump(constellation, f, indent=2)
+                print(f"[Dashboard] Survey saved: {len(room_markers)} wall + {len(constellation)} floor markers")
+            except Exception as e:
+                print(f"[Dashboard] Survey save error: {e}")
+                ok = False
+            self.send_response(200 if ok else 500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": ok, "wall": len(room_markers), "floor": len(constellation)}).encode())
+        elif self.path == '/api/servo':
+            length = int(self.headers['Content-Length'])
+            body = json.loads(self.rfile.read(length).decode())
+            pin = int(body.get('pin', 21))
+            angle = int(body.get('angle', 90))
+            new_cmd = f"S{pin} {angle}"
+            tag = f"S{pin} "
+            with state.lock:
+                state.manual_cmds = [c for c in state.manual_cmds if not c.startswith(tag)]
+                state.manual_cmds.append(new_cmd)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+        elif self.path == '/api/led':
+            length = int(self.headers['Content-Length'])
+            data = json.loads(self.rfile.read(length).decode())
+            brightness = data.get('brightness', 0)
+            print(f"[Dashboard] LED toggle request: brightness={brightness}")
+            
+            # If state hasn't been linked yet, try to find it
+            target = state.vision_module
+            if not target:
+                from dimos_lite.core import Module
+                # Module.registry stores all active modules by name
+                target = Module.registry.get("VisionV4")
+                
+            if target:
+                print(f"[Dashboard] Found target: {target.name}. Dispatching {brightness} to hardware...")
+                target._set_led(brightness)
+            else:
+                print("[Dashboard] Error: Vision module not found in registry")
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
 
     def _serve_state(self):
         self.send_response(200)
@@ -107,6 +236,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
                 "logs": state.logs[-50:],
                 "map": state.map_data,
                 "uptime": int(time.time() - state.start_time),
+                "survey_pins": {str(k): v for k, v in state.survey_pins.items()},
             }
         self.wfile.write(json.dumps(data).encode())
 
@@ -164,20 +294,26 @@ body{background:var(--bg);color:var(--text);font-family:'Inter','SF Pro Display'
 .topbar-stats span{display:flex;align-items:center;gap:4px}
 .topbar-stats .val{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
 .main{display:flex;flex:1;overflow:hidden}
-.col-left{flex:0 0 55%;display:flex;flex-direction:column;border-right:1px solid var(--border)}
-.col-right{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.col-left{flex:0 0 55%;display:flex;flex-direction:column;min-width:280px;overflow:hidden}
+.col-right{flex:1;display:flex;flex-direction:column;min-width:240px;overflow:hidden}
 .panel{background:var(--surface);border:1px solid var(--border);margin:6px;border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
 .panel-head{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-dim);font-weight:600}
 .panel-body{flex:1;overflow:hidden;position:relative}
-.video-panel{flex:1}
-.video-panel .panel-body{background:#000}
-.video-panel img{width:100%;height:100%;object-fit:contain;display:block}
-.brain-panel{flex:0 0 200px}
-.radar-panel{flex:0 0 280px}
-.radar-panel .panel-body{display:flex;align-items:center;justify-content:center;padding:8px}
-.map-panel{flex:1}
-.map-panel .panel-body{display:flex;align-items:center;justify-content:center;padding:4px;overflow:hidden}
-.log-panel{flex:0 0 180px}
+/* Video panel takes the full column width; height comes from aspect-ratio
+   so it tracks whatever the camera is actually streaming. JS overrides the
+   aspect-ratio once the first frame loads (see naturalWidth handler in
+   poll()), defaulting to 4/3 for VGA. Capped at 60vh so the brain/radar/map
+   panels below always get a usable share of the column. */
+.video-panel{flex:0 0 auto;width:100%;aspect-ratio:4/3;max-height:60vh;min-height:0}
+.video-panel .panel-body{background:#000;display:flex;justify-content:center;align-items:center;padding:0;overflow:hidden}
+.video-panel img{width:100%;height:100%;object-fit:contain;background:#000;image-rendering:pixelated}
+.brain-panel{flex:1 1 420px;min-height:420px}
+.brain-panel .panel-body{overflow-y:auto}
+.radar-panel{flex:0 0 280px;min-height:140px}
+.radar-panel .panel-body{padding:0;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
+.map-panel{flex:1;min-height:120px}
+.map-panel .panel-body{padding:0;overflow:hidden}
+.log-panel{flex:0 0 180px;min-height:80px}
 .log-panel .panel-body{overflow-y:auto;padding:4px 8px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:11px;line-height:1.6}
 .log-entry{padding:2px 0;border-bottom:1px solid rgba(255,255,255,.03)}
 .log-entry .act{font-weight:700}
@@ -186,8 +322,14 @@ body{background:var(--bg);color:var(--text);font-family:'Inter','SF Pro Display'
 .log-entry .act-left,.log-entry .act-right{color:var(--accent2)}
 .log-entry .act-stop{color:var(--danger)}
 canvas#radar{display:block}
-canvas#floorplan{display:block}
-.brain-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;height:100%;background:var(--border)}
+canvas#floorplan{display:block;width:100%;height:100%}
+.resize-h{flex:0 0 5px;background:var(--border);cursor:row-resize;position:relative;z-index:5;transition:background .15s}
+.resize-h:hover,.resize-h.dragging{background:rgba(34,211,238,0.5)}
+.resize-v{flex:0 0 5px;background:var(--border);cursor:col-resize;position:relative;z-index:5;transition:background .15s}
+.resize-v:hover,.resize-v.dragging{background:rgba(34,211,238,0.5)}
+body.resizing-h{cursor:row-resize !important;user-select:none}
+body.resizing-v{cursor:col-resize !important;user-select:none}
+.brain-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border)}
 .brain-cell{background:var(--surface);padding:8px 10px;display:flex;flex-direction:column}
 .brain-cell .label{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim);margin-bottom:4px}
 .brain-cell .value{font-size:13px;font-weight:600;line-height:1.3;word-break:break-word}
@@ -204,6 +346,36 @@ canvas#floorplan{display:block}
 .alert-bar.emergency{background:var(--danger);color:#fff}
 @keyframes flash{0%,100%{opacity:1}50%{opacity:.7}}
 .aruco-tag{display:inline-block;padding:1px 6px;border-radius:3px;background:rgba(245,158,11,0.15);color:#f59e0b;font-size:10px;font-weight:700;margin-left:6px}
+.survey-toggle{cursor:pointer;background:rgba(34,211,238,0.1);border:1px solid var(--border);color:var(--text-dim);padding:1px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
+.survey-toggle.active{background:var(--accent);color:#000;border-color:var(--accent)}
+.survey-overlay{position:absolute;left:6px;right:6px;bottom:6px;background:rgba(8,12,20,0.96);border:1px solid var(--accent);border-radius:6px;display:none;z-index:10;cursor:pointer}
+.survey-overlay.active{display:block}
+.survey-overlay-bar{padding:5px 10px;display:flex;align-items:center;justify-content:space-between;font-size:10px;color:var(--text-dim);font-family:monospace;letter-spacing:.3px}
+.survey-overlay-bar .chev{color:var(--accent);font-weight:700;font-family:sans-serif;font-size:11px}
+.survey-overlay.expanded{cursor:default}
+.survey-overlay-body{display:none;padding:6px 8px 8px;border-top:1px solid var(--border)}
+.survey-overlay.expanded .survey-overlay-body{display:block}
+.survey-overlay .grp{display:flex;flex-wrap:wrap;gap:3px;margin-bottom:4px;align-items:center}
+.survey-overlay .grp-label{font-size:9px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-right:4px}
+.mid-btn{width:22px;height:22px;border-radius:3px;border:1px solid var(--border);background:transparent;color:var(--text-dim);font-size:10px;font-weight:700;cursor:pointer;font-family:monospace}
+.mid-btn:hover{border-color:var(--accent);color:var(--accent)}
+.mid-btn.wall{border-color:#f59e0b}
+.mid-btn.pinned{background:rgba(34,197,94,0.2);color:#22c55e;border-color:#22c55e}
+.mid-btn.active{background:var(--accent);color:#000;border-color:var(--accent);box-shadow:0 0 6px rgba(34,211,238,0.6)}
+.survey-actions{display:flex;gap:4px;margin-top:6px;align-items:center}
+.survey-actions .info{flex:1;font-size:10px;color:var(--text-dim);font-family:monospace}
+.survey-btn{padding:3px 8px;font-size:10px;font-weight:700;border-radius:3px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;text-transform:uppercase;letter-spacing:.5px}
+.survey-btn.primary{border-color:var(--ok);color:var(--ok)}
+.survey-btn.primary:hover{background:rgba(34,197,94,0.15)}
+.survey-btn.danger{border-color:var(--danger);color:var(--danger)}
+.survey-btn.danger:hover{background:rgba(239,68,68,0.15)}
+.facing-popup{position:fixed;background:#0a0e17;border:1px solid var(--accent);border-radius:6px;padding:6px;display:none;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,0.5)}
+.facing-popup.active{display:block}
+.facing-popup .face-grid{display:grid;grid-template-columns:repeat(3,28px);grid-template-rows:repeat(3,28px);gap:2px}
+.facing-popup .face-btn{border:1px solid var(--border);background:transparent;color:var(--text-dim);font-size:10px;font-weight:700;cursor:pointer;border-radius:3px;font-family:monospace}
+.facing-popup .face-btn:hover{border-color:var(--accent);color:var(--accent)}
+.facing-popup .face-btn.center{cursor:default;color:#f59e0b;border-color:#f59e0b;font-size:14px}
+.facing-popup .face-label{font-size:9px;color:var(--text-dim);text-align:center;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
 </style>
 </head>
 <body>
@@ -211,6 +383,9 @@ canvas#floorplan{display:block}
   <div class="topbar-left">
     <div class="status-dot" id="statusDot"></div>
     <div class="logo">AGENTIC PET OS</div>
+    <button id="ledBtn" onclick="toggleLED()" style="background:#f1c40f; color:#000; border:none; padding:4px 8px; border-radius:4px; font-weight:bold; cursor:pointer; font-size:10px; display:flex; align-items:center; gap:4px;">
+      💡 LED
+    </button>
   </div>
   <div class="topbar-stats">
     <span>TICK <span class="val" id="statTick">0</span></span>
@@ -228,6 +403,7 @@ canvas#floorplan{display:block}
       <div class="panel-head"><span>LIVE VISION</span><span id="camRes">---</span></div>
       <div class="panel-body"><img id="video" src="/video_feed" alt="Camera"></div>
     </div>
+    <div class="resize-h" id="resizeVideoBrain" title="Drag to resize"></div>
     <div class="panel brain-panel">
       <div class="panel-head"><span>AGENTIC INTELLIGENCE</span><span id="brainAction" style="background:var(--accent);color:#000;padding:0 6px;border-radius:3px">IDLE</span></div>
       <div class="panel-body">
@@ -241,9 +417,14 @@ canvas#floorplan{display:block}
             <div class="value" id="brainObs" style="font-size:12px">Waiting for vision...</div>
           </div>
           <div class="brain-cell">
-            <div class="label">Forward Distance</div>
+            <div class="label">Sonar (HC-SR04)</div>
             <div class="value" id="brainDist">---</div>
             <div class="sensor-bar"><div class="sensor-bar-fill" id="distBar" style="width:0;background:var(--ok)"></div></div>
+          </div>
+          <div class="brain-cell">
+            <div class="label">Laser (VL53L0X)</div>
+            <div class="value" id="brainTof">---</div>
+            <div class="sensor-bar"><div class="sensor-bar-fill" id="tofBar" style="width:0;background:var(--accent2)"></div></div>
           </div>
           <div class="brain-cell">
             <div class="label">Heading <span id="imuBadge" style="display:none;font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(34,211,238,0.2);color:#22d3ee;margin-left:4px">IMU</span></div>
@@ -252,6 +433,10 @@ canvas#floorplan{display:block}
           <div class="brain-cell">
             <div class="label">Speed / Mileage</div>
             <div class="value" id="brainSpeed">0 cm/s | 0 cm</div>
+          </div>
+          <div class="brain-cell" style="grid-column: span 2">
+            <div class="label">IMU Accel (g)</div>
+            <div class="value" id="brainAccel" style="font-family:monospace;font-size:11px">x: --- &nbsp;&nbsp; y: --- &nbsp;&nbsp; z: ---</div>
           </div>
           <div class="brain-cell" style="grid-column: span 2">
             <div class="label">Grayscale (Floor Sensors)</div>
@@ -265,23 +450,74 @@ canvas#floorplan{display:block}
         </div>
       </div>
     </div>
-    <div class="controls-row">
-      <button class="ctrl-btn" data-cmd="forward">W Forward</button>
-      <button class="ctrl-btn" data-cmd="left">A Left</button>
-      <button class="ctrl-btn danger" data-cmd="stop">STOP</button>
-      <button class="ctrl-btn" data-cmd="right">D Right</button>
-      <button class="ctrl-btn" data-cmd="backward">S Back</button>
+    <div class="panel" style="flex: 0 0 52px; margin: 6px">
+      <div class="controls-row">
+        <button class="ctrl-btn" data-cmd="forward">W Fwd</button>
+        <button class="ctrl-btn" data-cmd="left">A Left</button>
+        <button class="ctrl-btn" data-cmd="backward">S Back</button>
+        <button class="ctrl-btn" data-cmd="right">D Right</button>
+        <button class="ctrl-btn danger" data-cmd="stop">&#9251; Stop</button>
+      </div>
     </div>
   </div>
+  <div class="resize-v" id="resizeColumns" title="Drag to resize columns"></div>
   <div class="col-right">
     <div class="panel radar-panel">
       <div class="panel-head"><span>RADAR SWEEP</span><span id="radarCount">0 pts</span></div>
-      <div class="panel-body"><canvas id="radar" width="260" height="260"></canvas></div>
+      <div class="panel-body" id="radarBody"><canvas id="radar"></canvas></div>
     </div>
+    <div class="resize-h" id="resizeRadarMap" title="Drag to resize"></div>
     <div class="panel map-panel">
-      <div class="panel-head"><span>FLOOR PLAN</span><span id="mapPos">---</span></div>
-      <div class="panel-body"><canvas id="floorplan" width="380" height="380"></canvas></div>
+      <div class="panel-head">
+        <span>FLOOR PLAN</span>
+        <span style="display:flex;align-items:center;gap:8px">
+          <span id="mapPos">---</span>
+          <button class="survey-toggle" id="surveyToggle">📍 Survey</button>
+        </span>
+      </div>
+      <div class="panel-body" id="floorplanBody" style="position:relative">
+        <canvas id="floorplan"></canvas>
+        <div class="survey-overlay" id="surveyOverlay">
+          <div class="survey-overlay-bar" id="surveyBar">
+            <span id="surveyBarStatus">Survey ready — click to expand</span>
+            <span class="chev" id="surveyChev">▲</span>
+          </div>
+          <div class="survey-overlay-body">
+            <div class="grp">
+              <span class="grp-label">Wall</span>
+              <button class="mid-btn wall" data-mid="0" data-type="wall">0</button>
+              <button class="mid-btn wall" data-mid="1" data-type="wall">1</button>
+              <button class="mid-btn wall" data-mid="2" data-type="wall">2</button>
+              <button class="mid-btn wall" data-mid="3" data-type="wall">3</button>
+              <button class="mid-btn wall" data-mid="4" data-type="wall">4</button>
+            </div>
+            <div class="grp" id="floorBtnGrp">
+              <span class="grp-label">Floor</span>
+            </div>
+            <div class="survey-actions">
+              <span class="info" id="surveyInfo">Pick a marker, then click on the floor plan</span>
+              <button class="survey-btn primary" id="surveySaveBtn">Save</button>
+              <button class="survey-btn danger" id="surveyClearBtn">Clear</button>
+            </div>
+          </div>
+        </div>
+        <div class="facing-popup" id="facingPopup">
+          <div class="face-label">Marker faces…</div>
+          <div class="face-grid">
+            <button class="face-btn" data-deg="315">NW</button>
+            <button class="face-btn" data-deg="0">N</button>
+            <button class="face-btn" data-deg="45">NE</button>
+            <button class="face-btn" data-deg="270">W</button>
+            <button class="face-btn center" disabled>◆</button>
+            <button class="face-btn" data-deg="90">E</button>
+            <button class="face-btn" data-deg="225">SW</button>
+            <button class="face-btn" data-deg="180">S</button>
+            <button class="face-btn" data-deg="135">SE</button>
+          </div>
+        </div>
+      </div>
     </div>
+    <div class="resize-h" id="resizeMapLog" title="Drag to resize"></div>
     <div class="panel log-panel">
       <div class="panel-head"><span>ACTION LOG</span><span id="logCount">0</span></div>
       <div class="panel-body" id="logBody"></div>
@@ -292,9 +528,57 @@ canvas#floorplan{display:block}
 function send(cmd){
   fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:cmd})});
 }
+function toggleLED(){
+  const btn = document.getElementById('ledBtn');
+  const active = btn.style.boxShadow !== '';
+  const val = active ? 0 : 50;
+  btn.style.boxShadow = active ? '' : '0 0 15px #f1c40f';
+  btn.style.background = active ? '#f1c40f' : '#fff';
+  fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({brightness:val})});
+}
 
-/* ── FPV-style real-time control ─────────────────────── */
-const keyMap={w:'forward',a:'left',s:'backward',d:'right',' ':'stop',ArrowUp:'forward',ArrowLeft:'left',ArrowDown:'backward',ArrowRight:'right'};
+/* ── Pan-Tilt Servo State ─────────────────────────── */
+let pan = 90, tilt = 90;
+// Arrow keys nudge the head at SERVO_STEP° per ARROW_INTERVAL_MS. The Pico
+// interpolates at ~200°/s — a little faster than this rate so it always
+// catches up between sends. That lets motion stop within ~1° of release.
+const SERVO_STEP = 2;
+const ARROW_INTERVAL_MS = 50;
+function moveServo(dp, dt){
+  // Only POST the servo whose angle actually changed. Sending both every tick
+  // doubles the queue and makes the servo not asked to move briefly fight
+  // the noisy stream of redundant identical commands.
+  if(dp){
+    const np = Math.max(0, Math.min(180, pan + dp));
+    if(np !== pan){
+      pan = np;
+      fetch('/api/servo', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pin:20, angle:pan})});
+    }
+  }
+  if(dt){
+    const nt = Math.max(0, Math.min(180, tilt + dt));
+    if(nt !== tilt){
+      tilt = nt;
+      fetch('/api/servo', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pin:21, angle:tilt})});
+    }
+  }
+}
+
+/* Continuous-while-held for arrow keys (mirrors WASD's startManual). */
+const arrowMap = {ArrowLeft:[SERVO_STEP,0], ArrowRight:[-SERVO_STEP,0], ArrowUp:[0,-SERVO_STEP], ArrowDown:[0,SERVO_STEP]};
+const arrowsHeld = new Set();
+let arrowTx = null;
+function startArrows(){
+  if(arrowTx) return;
+  arrowTx = setInterval(()=>{
+    if(!arrowsHeld.size){clearInterval(arrowTx); arrowTx=null; return;}
+    let dp=0, dt=0;
+    arrowsHeld.forEach(k=>{ const [p,t]=arrowMap[k]; dp+=p; dt+=t; });
+    moveServo(dp, dt);
+  }, ARROW_INTERVAL_MS);
+}
+
+const keyMap={w:'forward',a:'left',s:'backward',d:'right',' ':'stop'};
 const pressed=new Set();
 let manualTx=null;
 
@@ -307,18 +591,42 @@ function startManual(){
     if(cmd&&cmd!=='stop')send(cmd);
   },80);
 }
+
 document.addEventListener('keydown',e=>{
-  const cmd=keyMap[e.key];
-  if(!cmd||e.repeat)return;
-  e.preventDefault();
-  pressed.add(e.key);
-  if(cmd==='stop'){send('stop');return;}
-  send(cmd);
-  startManual();
+  if(e.repeat)return;
+  const k=e.key.toLowerCase();
+  const cmd=keyMap[k];
+  if(cmd){
+    e.preventDefault();
+    pressed.add(k);
+    if(cmd==='stop'){send('stop');return;}
+    send(cmd);
+    startManual();
+    return;
+  }
+  if(arrowMap[e.key]){
+    e.preventDefault();
+    arrowsHeld.add(e.key);
+    const [p,t] = arrowMap[e.key];
+    moveServo(p, t);   // immediate first step
+    startArrows();     // then repeat while held
+  }
 });
+
 document.addEventListener('keyup',e=>{
-  pressed.delete(e.key);
-  if(!pressed.size){send('stop');if(manualTx){clearInterval(manualTx);manualTx=null;}}
+  const k=e.key.toLowerCase();
+  if(keyMap[k]){
+    pressed.delete(k);
+    if(!pressed.size){
+      if(manualTx){clearInterval(manualTx);manualTx=null;}
+      send('stop');
+    }
+    return;
+  }
+  if(arrowMap[e.key]){
+    arrowsHeld.delete(e.key);
+    if(!arrowsHeld.size && arrowTx){clearInterval(arrowTx); arrowTx=null;}
+  }
 });
 
 /* Button hold-to-move */
@@ -387,37 +695,233 @@ const ROOMS=[
 const APT_W=700,APT_H=700;
 const fpCanvas=document.getElementById('floorplan');
 const fpCtx=fpCanvas.getContext('2d');
+const fpBody=document.getElementById('floorplanBody');
+function fitFloorplanCanvas(){
+  // Match the canvas drawing buffer to its rendered CSS size so the floor plan
+  // never overflows or letterboxes. Keep a 1:1 buffer-to-display ratio for crisp lines.
+  const w = Math.max(40, fpBody.clientWidth);
+  const h = Math.max(40, fpBody.clientHeight);
+  if(fpCanvas.width !== w) fpCanvas.width = w;
+  if(fpCanvas.height !== h) fpCanvas.height = h;
+}
+fitFloorplanCanvas();
+window.addEventListener('resize', fitFloorplanCanvas);
+if(window.ResizeObserver) new ResizeObserver(fitFloorplanCanvas).observe(fpBody);
+
+const radarBody=document.getElementById('radarBody');
+function fitRadarCanvas(){
+  // Radar is square; inscribe it in the smaller dimension of the panel-body.
+  const w = Math.max(40, radarBody.clientWidth - 8);
+  const h = Math.max(40, radarBody.clientHeight - 8);
+  const size = Math.min(w, h);
+  if(radarCanvas.width !== size) radarCanvas.width = size;
+  if(radarCanvas.height !== size) radarCanvas.height = size;
+}
+fitRadarCanvas();
+window.addEventListener('resize', fitRadarCanvas);
+if(window.ResizeObserver) new ResizeObserver(fitRadarCanvas).observe(radarBody);
+
+/* ── Resize gutters (drag handles between panels) ────────── */
+function setupResizer(handle, target, axis, sign){
+  // axis: 'h' for vertical drag (row-resize, height change); 'v' for horizontal drag (col-resize, width change).
+  // sign: +1 if dragging in +coord direction grows the target; -1 if -coord direction grows it.
+  if(!handle || !target) return;
+  let startSize = 0, startCoord = 0;
+  function onMove(ev){
+    const cur = axis === 'h' ? ev.clientY : ev.clientX;
+    const delta = (cur - startCoord) * sign;
+    const newSize = Math.max(60, startSize + delta);
+    target.style.flex = `0 0 ${newSize}px`;
+  }
+  function onUp(){
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    handle.classList.remove('dragging');
+    document.body.classList.remove(axis === 'h' ? 'resizing-h' : 'resizing-v');
+  }
+  handle.addEventListener('mousedown', e=>{
+    e.preventDefault();
+    startCoord = axis === 'h' ? e.clientY : e.clientX;
+    startSize = axis === 'h' ? target.offsetHeight : target.offsetWidth;
+    handle.classList.add('dragging');
+    document.body.classList.add(axis === 'h' ? 'resizing-h' : 'resizing-v');
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+const colLeftEl = document.querySelector('.col-left');
+const brainPanelEl = document.querySelector('.brain-panel');
+const radarPanelEl = document.querySelector('.radar-panel');
+const logPanelEl = document.querySelector('.log-panel');
+// Handle between video and brain: drag UP grows brain (sign=-1).
+setupResizer(document.getElementById('resizeVideoBrain'), brainPanelEl, 'h', -1);
+// Handle between radar and map: drag DOWN grows radar (sign=+1).
+setupResizer(document.getElementById('resizeRadarMap'), radarPanelEl, 'h', +1);
+// Handle between map and log: drag UP grows log (sign=-1).
+setupResizer(document.getElementById('resizeMapLog'), logPanelEl, 'h', -1);
+// Handle between columns: drag RIGHT grows col-left (sign=+1).
+setupResizer(document.getElementById('resizeColumns'), colLeftEl, 'v', +1);
 let trailPts=[];
 let smoothX=350,smoothY=350,smoothHdg=0;
 let placePulse=0;
 
-/* Click-to-place: click on map to set robot position */
-  // Marker Placement (Shift+Click)
-  fpCanvas.style.cursor='crosshair';
-  fpCanvas.onclick=e=>{
-    const rect=fpCanvas.getBoundingClientRect();
-    const cx=e.clientX-rect.left, cy=e.clientY-rect.top;
-    const cw=fpCanvas.width,ch=fpCanvas.height;
-    const s=Math.min(cw/APT_W,ch/APT_H)*0.92;
-    const ox=(cw-APT_W*s)/2,oy=(ch-APT_H*s)/2;
-    const ax=(cx-ox)/s, ay=(cy-oy)/s;
-    if(ax<0||ax>APT_W||ay<0||ay>APT_H)return;
+/* ── Marker Survey (M0) ─────────────────────────────── */
+const FLOOR_IDS = Array.from({length:22}, (_,i)=>10+i);  // 10..31
+const WALL_LABELS = {0:'Living Rm', 1:'Kitchen', 2:'Bedroom', 3:'Bath', 4:'Entry'};
+let surveyMode = false;
+let activeMid = null;
+let activeType = null;
+let surveyPins = {};  // mirrors server state
+let pendingFacing = null;  // {mid, x, y} awaiting facing choice
+const surveyOverlay = document.getElementById('surveyOverlay');
+const surveyToggle = document.getElementById('surveyToggle');
+const surveyInfo = document.getElementById('surveyInfo');
+const facingPopup = document.getElementById('facingPopup');
 
-    if(e.shiftKey){
-      const mid = prompt("Enter Marker ID for this spot (0-4):", "0");
-      if(mid!==null){
-        fetch('/api/set_marker',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:parseInt(mid),x:ax,y:ay})});
-      }
-      return;
+// Build the 22 floor-marker buttons.
+const floorGrp = document.getElementById('floorBtnGrp');
+FLOOR_IDS.forEach(mid=>{
+  const b = document.createElement('button');
+  b.className = 'mid-btn';
+  b.dataset.mid = mid; b.dataset.type = 'floor';
+  b.textContent = mid;
+  floorGrp.appendChild(b);
+});
+
+surveyToggle.onclick = ()=>{
+  surveyMode = !surveyMode;
+  surveyToggle.classList.toggle('active', surveyMode);
+  surveyOverlay.classList.toggle('active', surveyMode);
+  if(!surveyMode){
+    activeMid = null; pendingFacing = null;
+    facingPopup.classList.remove('active');
+    surveyOverlay.classList.remove('expanded');
+  }
+  refreshSurveyButtons();
+};
+
+const surveyBar = document.getElementById('surveyBar');
+const surveyChev = document.getElementById('surveyChev');
+surveyBar.onclick = (e)=>{
+  // Expanding from collapsed; collapse via the chev when expanded.
+  if(!surveyOverlay.classList.contains('expanded')){
+    surveyOverlay.classList.add('expanded');
+    surveyChev.textContent = '▼';
+  } else if(e.target === surveyChev){
+    surveyOverlay.classList.remove('expanded');
+    surveyChev.textContent = '▲';
+  }
+};
+
+function refreshSurveyButtons(){
+  document.querySelectorAll('.mid-btn').forEach(b=>{
+    const mid = parseInt(b.dataset.mid);
+    b.classList.toggle('pinned', surveyPins[mid] !== undefined);
+    b.classList.toggle('active', mid === activeMid);
+  });
+  const wallDone = [0,1,2,3,4].filter(m=>surveyPins[m]).length;
+  const floorDone = FLOOR_IDS.filter(m=>surveyPins[m]).length;
+  const summary = `Survey: ${wallDone}/5 wall · ${floorDone}/22 floor`;
+  document.getElementById('surveyBarStatus').textContent =
+    activeMid !== null
+      ? `${summary} · active: ${activeMid}${activeType==='wall'?' ('+(WALL_LABELS[activeMid]||'Wall')+')':''}`
+      : summary;
+  if(activeMid !== null){
+    const lbl = activeType === 'wall' ? `${activeMid} (${WALL_LABELS[activeMid]||'Wall'})` : `${activeMid} (Floor)`;
+    const pinned = surveyPins[activeMid];
+    surveyInfo.textContent = pinned
+      ? `${lbl} — pinned at (${Math.round(pinned.x)}, ${Math.round(pinned.y)}). Click to re-pin.`
+      : `${lbl} — click on the floor plan to pin.`;
+  } else if(surveyMode){
+    surveyInfo.textContent = `Pinned: ${wallDone}/5 wall, ${floorDone}/22 floor`;
+  }
+}
+
+document.querySelectorAll('.mid-btn').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    activeMid = parseInt(b.dataset.mid);
+    activeType = b.dataset.type;
+    pendingFacing = null;
+    facingPopup.classList.remove('active');
+    refreshSurveyButtons();
+  });
+});
+
+document.getElementById('surveySaveBtn').onclick = async ()=>{
+  const r = await fetch('/api/save_survey', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  const j = await r.json();
+  surveyInfo.textContent = j.ok ? `Saved ${j.wall} wall + ${j.floor} floor markers to disk. Restart agent to apply.` : 'Save failed — check server log.';
+};
+document.getElementById('surveyClearBtn').onclick = async ()=>{
+  if(!confirm('Clear all surveyed markers (in-memory; disk untouched until you Save)?')) return;
+  for(const mid of Object.keys(surveyPins)){
+    await fetch('/api/unpin_marker', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id:parseInt(mid)})});
+  }
+  surveyPins = {}; activeMid = null; refreshSurveyButtons();
+};
+
+document.querySelectorAll('.facing-popup .face-btn').forEach(b=>{
+  if(!b.dataset.deg) return;
+  b.addEventListener('click', async ()=>{
+    if(!pendingFacing) return;
+    const facing_deg = parseInt(b.dataset.deg);
+    const {mid, x, y} = pendingFacing;
+    await fetch('/api/pin_marker', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id:mid, x, y, type:'wall', facing_deg})});
+    surveyPins[mid] = {x, y, type:'wall', facing_deg};
+    pendingFacing = null;
+    facingPopup.classList.remove('active');
+    activeMid = null;
+    refreshSurveyButtons();
+  });
+});
+
+/* Click-to-place / Survey-pin: click on map either pins active survey marker or sets robot position */
+fpCanvas.style.cursor='crosshair';
+fpCanvas.onclick=async e=>{
+  const rect=fpCanvas.getBoundingClientRect();
+  const cx=e.clientX-rect.left, cy=e.clientY-rect.top;
+  const cw=fpCanvas.width,ch=fpCanvas.height;
+  const s=Math.min(cw/APT_W,ch/APT_H)*0.92;
+  const ox=(cw-APT_W*s)/2,oy=(ch-APT_H*s)/2;
+  const ax=(cx-ox)/s, ay=(cy-oy)/s;
+  if(ax<0||ax>APT_W||ay<0||ay>APT_H)return;
+
+  if(surveyMode && activeMid !== null){
+    if(activeType === 'wall'){
+      // Two-step: position then facing.
+      pendingFacing = {mid:activeMid, x:ax, y:ay};
+      // Position the popup near the click, clamped to viewport.
+      const popupRect = {w:120, h:130};
+      let px = e.clientX + 12, py = e.clientY + 12;
+      if(px + popupRect.w > window.innerWidth) px = e.clientX - popupRect.w - 12;
+      if(py + popupRect.h > window.innerHeight) py = e.clientY - popupRect.h - 12;
+      facingPopup.style.left = px + 'px';
+      facingPopup.style.top = py + 'px';
+      facingPopup.classList.add('active');
+      surveyInfo.textContent = `Marker ${activeMid} at (${Math.round(ax)}, ${Math.round(ay)}) — pick facing direction.`;
+    } else {
+      await fetch('/api/pin_marker', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({id:activeMid, x:ax, y:ay, type:'floor'})});
+      surveyPins[activeMid] = {x:ax, y:ay, type:'floor'};
+      // Auto-advance to next unpinned floor marker.
+      const next = FLOOR_IDS.find(m => !surveyPins[m] && m > activeMid) || FLOOR_IDS.find(m => !surveyPins[m]);
+      activeMid = next ?? null;
+      activeType = next != null ? 'floor' : null;
+      refreshSurveyButtons();
     }
+    return;
+  }
 
-    smoothX=ax;smoothY=ay;
-    placePulse=Date.now();
-    trailPts=[];
-    const room=ROOMS.find(r=>ax>=r.x&&ax<=r.x+r.w&&ay>=r.y&&ay<=r.y+r.h);
-    document.getElementById('mapPos').textContent='\u{1f4cd} '+(room?room.label:'Placed')+' ('+Math.round(ax)+','+Math.round(ay)+')';
-    fetch('/api/set_position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:ax,y:ay})});
-  };
+  // Default: set robot position.
+  smoothX=ax;smoothY=ay;
+  placePulse=Date.now();
+  trailPts=[];
+  const room=ROOMS.find(r=>ax>=r.x&&ax<=r.x+r.w&&ay>=r.y&&ay<=r.y+r.h);
+  document.getElementById('mapPos').textContent='\u{1f4cd} '+(room?room.label:'Placed')+' ('+Math.round(ax)+','+Math.round(ay)+')';
+  fetch('/api/set_position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:ax,y:ay})});
+};
 
   function drawFloorplan(d){
     const cw=fpCanvas.width,ch=fpCanvas.height;
@@ -449,13 +953,31 @@ let placePulse=0;
       }
     });
 
-    // Draw user-placed markers
-    if(d.marker_positions){
-      Object.entries(d.marker_positions).forEach(([mid,pos])=>{
-        const mx=ox+pos[0]*s, my=oy+pos[1]*s;
-        fpCtx.fillStyle='#f59e0b';fpCtx.font='10px sans-serif';
-        fpCtx.fillText('\u25c6',mx,my);
-        fpCtx.font='7px sans-serif';fpCtx.fillText('ID:'+mid,mx,my+8);
+    // Draw surveyed markers (M0). Wall markers get a facing arrow.
+    if(d.survey_pins){
+      Object.entries(d.survey_pins).forEach(([midStr, pin])=>{
+        const mid = parseInt(midStr);
+        const mx = ox + pin.x * s, my = oy + pin.y * s;
+        const isWall = pin.type === 'wall';
+        const isActive = (mid === activeMid && surveyMode);
+        fpCtx.beginPath();
+        fpCtx.arc(mx, my, isActive ? 6 : 4, 0, Math.PI*2);
+        fpCtx.fillStyle = isWall ? '#f59e0b' : '#22d3ee';
+        fpCtx.fill();
+        if(isActive){ fpCtx.strokeStyle='#fff'; fpCtx.lineWidth=1.5; fpCtx.stroke(); }
+        // Facing arrow for wall markers
+        if(isWall && pin.facing_deg !== undefined){
+          const rad = pin.facing_deg * Math.PI / 180;
+          fpCtx.beginPath();
+          fpCtx.moveTo(mx, my);
+          fpCtx.lineTo(mx + Math.sin(rad) * 12, my - Math.cos(rad) * 12);
+          fpCtx.strokeStyle = '#f59e0b'; fpCtx.lineWidth = 2; fpCtx.stroke();
+        }
+        // ID label
+        fpCtx.fillStyle = '#e2e8f0';
+        fpCtx.font = 'bold 9px monospace';
+        fpCtx.textAlign = 'center'; fpCtx.textBaseline = 'middle';
+        fpCtx.fillText(mid, mx, my - 9);
       });
     }
 
@@ -591,9 +1113,21 @@ async function poll(){
     const distBar=document.getElementById('distBar');
     distBar.style.width=distPct+'%';
     distBar.style.background=d.forward_dist<30?'var(--danger)':d.forward_dist<60?'var(--warn)':'var(--ok)';
+    // Laser tile (VL53L0X). tof_distance is null when out-of-range.
+    const tofVal=(d.tof_distance==null)?'---':d.tof_distance.toFixed(1)+' cm';
+    document.getElementById('brainTof').textContent=tofVal;
+    const tofBar=document.getElementById('tofBar');
+    if(d.tof_distance==null){tofBar.style.width='0';}
+    else{
+      tofBar.style.width=Math.min(100,d.tof_distance/2)+'%';
+      tofBar.style.background=d.tof_distance<30?'var(--danger)':d.tof_distance<60?'var(--warn)':'var(--accent2)';
+    }
     document.getElementById('brainHeading').textContent=Math.round(d.heading)+' deg'+(d.has_imu?' (gz:'+d.imu_gyro_z.toFixed(1)+')':'');
     document.getElementById('imuBadge').style.display=d.has_imu?'inline':'none';
     document.getElementById('brainSpeed').textContent=(d.speed||0).toFixed(1)+' cm/s | '+(d.mileage||0).toFixed(1)+' cm';
+    // IMU accel tile — three axes in g
+    const ac=d.imu_accel||[0,0,0];
+    document.getElementById('brainAccel').textContent='x: '+(ac[0]||0).toFixed(2)+'  y: '+(ac[1]||0).toFixed(2)+'  z: '+(ac[2]||0).toFixed(2);
     const gs=d.grayscale||[0,0,0];
     document.getElementById('brainGS').textContent=gs.map(v=>v.toFixed?v.toFixed(0):v).join(' / ');
     ['gs0','gs1','gs2'].forEach((id,i)=>{
@@ -604,6 +1138,14 @@ async function poll(){
     // Map position header
     const posStr=d.aruco_room?'\u25c6 '+d.aruco_room:'('+Math.round(d.robot_x)+','+Math.round(d.robot_y)+')';
     document.getElementById('mapPos').textContent=posStr+' hdg '+Math.round(d.heading)+' deg';
+
+    // Hydrate surveyed-marker state from the server on first poll only — after that
+    // the JS is authoritative (avoids overwriting in-flight pins on the next poll tick).
+    if(d.survey_pins && !window._surveyHydrated){
+      window._surveyHydrated = true;
+      for(const [k, v] of Object.entries(d.survey_pins)) surveyPins[parseInt(k)] = v;
+      refreshSurveyButtons();
+    }
 
     try {
       drawRadar(d.radar_sweep);
@@ -623,9 +1165,17 @@ async function poll(){
       logBody.scrollTop=logBody.scrollHeight;
       document.getElementById('logCount').textContent=logs.length;
     }
-    // Camera resolution
+    // Camera resolution + dynamic aspect-ratio so the panel matches the
+    // stream and we don't get black bars eating the brain panel's space.
     const vid=document.getElementById('video');
-    if(vid.naturalWidth)document.getElementById('camRes').textContent=vid.naturalWidth+'x'+vid.naturalHeight;
+    if(vid.naturalWidth){
+      document.getElementById('camRes').textContent=vid.naturalWidth+'x'+vid.naturalHeight;
+      const aspect=vid.naturalWidth/vid.naturalHeight;
+      const panel=document.querySelector('.video-panel');
+      if(panel && Math.abs(parseFloat(panel.style.aspectRatio||'1.333')-aspect)>0.01){
+        panel.style.aspectRatio=aspect.toFixed(4);
+      }
+    }
 
     document.getElementById('statusDot').style.background='var(--ok)';
   }catch(e){
@@ -637,7 +1187,6 @@ poll();
 </script>
 </body>
 </html>"""
-
 
 def start_dashboard():
     socketserver.ThreadingTCPServer.allow_reuse_address = True
@@ -664,6 +1213,11 @@ def start_dashboard():
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
+def set_vision_module(vision):
+    with state.lock:
+        state.vision_module = vision
+
+
 def update_dashboard(frame=None, map_str=None, log_msg=None, **kwargs):
     with state.lock:
         if frame is not None:
@@ -681,9 +1235,9 @@ def update_dashboard(frame=None, map_str=None, log_msg=None, **kwargs):
 
 def get_manual_command():
     with state.lock:
-        cmd = state.manual_cmd
-        state.manual_cmd = None
-        return cmd
+        if state.manual_cmds:
+            return state.manual_cmds.pop(0)
+        return None
 
 
 def get_marker_updates():

@@ -35,11 +35,15 @@ class WS_Server():
             buf = self.uart.readline()
             if buf == None:
                 if block:
+                    if not hasattr(self, '_start_wait'): self._start_wait = time.ticks_ms()
+                    if time.ticks_diff(time.ticks_ms(), self._start_wait) > 5000:
+                        raise ValueError("ESP8266 Timeout: Is the battery switch ON?")
                     time.sleep_ms(1)
                     continue
                 else:
                     return None
 
+            if hasattr(self, '_start_wait'): delattr(self, '_start_wait')
             if buf[0] < 0x31 or buf[0] > 0xfe:
                 buf = buf[1:]
                 print("buf error: %s" % buf)
@@ -47,7 +51,11 @@ class WS_Server():
                     buf = None
                     return buf
 
-            buf = buf.decode().replace("\r\n", "")
+            try:
+                buf = buf.decode().replace("\r\n", "")
+            except Exception:
+                print("ESP8266 Decode Error (Garbage) - Ignoring")
+                return None
             if buf.startswith("[DEBUG] "):
                 buf = buf.replace("[DEBUG]", "[ESP8266]")
                 print(buf)

@@ -16,6 +16,10 @@ class DashboardState:
         self.logs = []
         self.lock = threading.Lock()
         self.vision_module = None
+        # Direct WS reference for servo passthrough — bypasses the agent's
+        # manual-cmd queue so HTTP→Pico latency is one method call + WS send,
+        # not HTTP→queue→agent-loop-wait→queue-drain→cmd_vel→WS.
+        self.pico_hw = None
         self.position_override = None
         self.telemetry = {
             "tick": 0,
@@ -41,7 +45,6 @@ class DashboardState:
             "imu_accel": [0, 0, 0],
             "emergency_stop": False,
             "uptime": 0,
-            "battery_v": 0.0,
             "marker_positions": {},
             "obstacles": [],
         }
@@ -188,15 +191,20 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"ok": ok, "wall": len(room_markers), "floor": len(constellation)}).encode())
         elif self.path == '/api/servo':
+            # Direct passthrough to the Pico. Servo commands (pan/tilt head)
+            # don't need to flow through the agent — they're hardware-level
+            # control, not behavioural intent. Going direct cuts the path
+            # from "HTTP → manual_cmds queue → agent loop wake → cmd_vel
+            # publish → WS" down to "HTTP → method call → WS", eliminating
+            # the agent-loop wait (was up to 50ms, now 10ms — but irrelevant
+            # because we no longer use that path) and any queue buildup.
             length = int(self.headers['Content-Length'])
             body = json.loads(self.rfile.read(length).decode())
             pin = int(body.get('pin', 21))
             angle = int(body.get('angle', 90))
-            new_cmd = f"S{pin} {angle}"
-            tag = f"S{pin} "
-            with state.lock:
-                state.manual_cmds = [c for c in state.manual_cmds if not c.startswith(tag)]
-                state.manual_cmds.append(new_cmd)
+            hw = state.pico_hw
+            if hw is not None:
+                hw._on_cmd_vel((f"S{pin}", angle))
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -393,7 +401,6 @@ body.resizing-v{cursor:col-resize !important;user-select:none}
     <span>LATENCY <span class="val" id="statLatency">---</span></span>
     <span>ZONE <span class="val" id="statZone">---</span></span>
     <span id="arucoTag" style="display:none" class="aruco-tag"></span>
-    <span id="battSpan" title="Battery Voltage">🔋 <span class="val" id="statBatt">---</span></span>
   </div>
 </div>
 <div class="alert-bar" id="alertBar"></div>
@@ -538,61 +545,95 @@ function toggleLED(){
 }
 
 /* ── Pan-Tilt Servo State ─────────────────────────── */
-let pan = 90, tilt = 90;
-// Arrow keys nudge the head at SERVO_STEP° per ARROW_INTERVAL_MS. The Pico
-// interpolates at ~200°/s — a little faster than this rate so it always
-// catches up between sends. That lets motion stop within ~1° of release.
-const SERVO_STEP = 2;
-const ARROW_INTERVAL_MS = 50;
-function moveServo(dp, dt){
-  // Only POST the servo whose angle actually changed. Sending both every tick
-  // doubles the queue and makes the servo not asked to move briefly fight
-  // the noisy stream of redundant identical commands.
-  if(dp){
-    const np = Math.max(0, Math.min(180, pan + dp));
-    if(np !== pan){
-      pan = np;
-      fetch('/api/servo', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pin:20, angle:pan})});
-    }
-  }
-  if(dt){
-    const nt = Math.max(0, Math.min(180, tilt + dt));
-    if(nt !== tilt){
-      tilt = nt;
-      fetch('/api/servo', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pin:21, angle:tilt})});
-    }
-  }
+/* ── Pan/Tilt servo control ───────────────────────────────────────────────
+ * Architecture: the JS side maintains a *target* angle for each servo (pan,
+ * tilt) and a separate sender that flushes the latest target whenever the
+ * previous fetch completes. This means:
+ *   - holding an arrow key advances the target every ARROW_INTERVAL_MS,
+ *   - only ever ONE in-flight fetch per pin (no localhost queue buildup),
+ *   - on release, no in-flight tail to drain — the last sent target IS the
+ *     final target, the Pico interpolates to it at 400°/s and stops.
+ * The Pico is the speed governor (interp at 400°/s); JS just declares intent.
+ */
+let pan = 90, tilt = 90;          // last value confirmed sent to the Pico
+let panTarget = 90, tiltTarget = 90;
+let panInFlight = false, tiltInFlight = false;
+// JS intent rate must stay below the Pico's real interp rate, otherwise the
+// target creeps ahead of pan_current and the gap drains on release as visible
+// "slow continued motion." Pico interp is ~300°/s real (3°/tick at ~10ms loop
+// period including sensor reads). 5°/40ms = 125°/s here gives the Pico ~2.4×
+// headroom — at release, max in-flight lag is one 5° bump = ~17ms drain.
+const SERVO_STEP_PER_TICK = 5;
+const ARROW_INTERVAL_MS = 40;
+
+function flushServo(pin){
+  const isPan = pin === 20;
+  if((isPan ? panInFlight : tiltInFlight)) return;
+  const want = isPan ? panTarget : tiltTarget;
+  const last = isPan ? pan : tilt;
+  if(want === last) return;
+  if(isPan){ pan = want; panInFlight = true; } else { tilt = want; tiltInFlight = true; }
+  fetch('/api/servo', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pin, angle:want}), keepalive:true})
+    .finally(()=>{
+      if(isPan){
+        panInFlight = false;
+        if(panTarget !== pan) flushServo(20);  // newer target arrived during flight
+      } else {
+        tiltInFlight = false;
+        if(tiltTarget !== tilt) flushServo(21);
+      }
+    });
 }
 
 /* Continuous-while-held for arrow keys (mirrors WASD's startManual). */
-const arrowMap = {ArrowLeft:[SERVO_STEP,0], ArrowRight:[-SERVO_STEP,0], ArrowUp:[0,-SERVO_STEP], ArrowDown:[0,SERVO_STEP]};
+const arrowMap = {ArrowLeft:[SERVO_STEP_PER_TICK,0], ArrowRight:[-SERVO_STEP_PER_TICK,0], ArrowUp:[0,-SERVO_STEP_PER_TICK], ArrowDown:[0,SERVO_STEP_PER_TICK]};
 const arrowsHeld = new Set();
 let arrowTx = null;
+// Clamp matches Pico firmware ±75°. The mapping is JS angle = Pico angle + 90,
+// so JS range 15..165 → Pico ±75°. Margins prevent SG90 end-stop dither.
+const SERVO_MIN = 15, SERVO_MAX = 165;
+function bumpTarget(dp, dt){
+  if(dp){ panTarget = Math.max(SERVO_MIN, Math.min(SERVO_MAX, panTarget + dp)); flushServo(20); }
+  if(dt){ tiltTarget = Math.max(SERVO_MIN, Math.min(SERVO_MAX, tiltTarget + dt)); flushServo(21); }
+}
 function startArrows(){
   if(arrowTx) return;
   arrowTx = setInterval(()=>{
     if(!arrowsHeld.size){clearInterval(arrowTx); arrowTx=null; return;}
     let dp=0, dt=0;
     arrowsHeld.forEach(k=>{ const [p,t]=arrowMap[k]; dp+=p; dt+=t; });
-    moveServo(dp, dt);
+    bumpTarget(dp, dt);
   }, ARROW_INTERVAL_MS);
 }
 
 const keyMap={w:'forward',a:'left',s:'backward',d:'right',' ':'stop'};
 const pressed=new Set();
 let manualTx=null;
+// Shift = boost. When held alongside any movement key, we suffix the command
+// with "_boost" and the agent dispatches at BOOST_SPEED instead of MANUAL_SPEED.
+// Shift-state changes mid-hold are picked up automatically because startManual
+// re-sends the active direction every 80ms.
+let boostHeld = false;
+
+function activeCmd(){
+  if(!pressed.size) return null;
+  const last=[...pressed].pop();
+  const base = keyMap[last];
+  if(!base || base==='stop') return null;
+  return boostHeld ? base + '_boost' : base;
+}
 
 function startManual(){
   if(manualTx)return;
   manualTx=setInterval(()=>{
     if(!pressed.size){clearInterval(manualTx);manualTx=null;return;}
-    const last=[...pressed].pop();
-    const cmd=keyMap[last];
-    if(cmd&&cmd!=='stop')send(cmd);
+    const cmd = activeCmd();
+    if(cmd) send(cmd);
   },80);
 }
 
 document.addEventListener('keydown',e=>{
+  if(e.key === 'Shift'){ boostHeld = true; return; }   // Shift = boost flag
   if(e.repeat)return;
   const k=e.key.toLowerCase();
   const cmd=keyMap[k];
@@ -600,20 +641,23 @@ document.addEventListener('keydown',e=>{
     e.preventDefault();
     pressed.add(k);
     if(cmd==='stop'){send('stop');return;}
-    send(cmd);
+    const out = activeCmd();
+    if(out) send(out);
     startManual();
     return;
   }
   if(arrowMap[e.key]){
     e.preventDefault();
+    if(e.repeat) return;       // OS auto-repeat would double-bump on each frame
     arrowsHeld.add(e.key);
     const [p,t] = arrowMap[e.key];
-    moveServo(p, t);   // immediate first step
-    startArrows();     // then repeat while held
+    bumpTarget(p, t);          // immediate first step
+    startArrows();             // then repeat while held
   }
 });
 
 document.addEventListener('keyup',e=>{
+  if(e.key === 'Shift'){ boostHeld = false; return; }  // releasing Shift = drop boost
   const k=e.key.toLowerCase();
   if(keyMap[k]){
     pressed.delete(k);
@@ -627,6 +671,19 @@ document.addEventListener('keyup',e=>{
     arrowsHeld.delete(e.key);
     if(!arrowsHeld.size && arrowTx){clearInterval(arrowTx); arrowTx=null;}
   }
+});
+
+// If the browser tab loses focus mid-hold, the keyup never fires and the
+// robot would keep driving. Reset everything and force-stop.
+window.addEventListener('blur', ()=>{
+  if(pressed.size){
+    pressed.clear();
+    if(manualTx){clearInterval(manualTx); manualTx=null;}
+    send('stop');
+  }
+  arrowsHeld.clear();
+  if(arrowTx){clearInterval(arrowTx); arrowTx=null;}
+  boostHeld = false;
 });
 
 /* Button hold-to-move */
@@ -1075,22 +1132,6 @@ async function poll(){
     document.getElementById('statLatency').textContent=d.latency?d.latency.toFixed(2)+'s':'---';
     document.getElementById('statZone').textContent=d.zone||'---';
 
-    // Battery
-    const bv=d.battery_v||0;
-    const battEl=document.getElementById('statBatt');
-    const battSpan=document.getElementById('battSpan');
-    if(bv>1.0){
-      const pct=Math.min(100,Math.max(0,((bv-6.0)/(8.4-6.0))*100));
-      const col=bv>7.0?'var(--ok)':bv>6.5?'var(--warn)':'var(--danger)';
-      battEl.textContent=bv.toFixed(2)+'V ('+Math.round(pct)+'%)';
-      battEl.style.color=col;
-      battSpan.title='Battery voltage';
-    } else {
-      battEl.textContent='N/A';
-      battEl.style.color='var(--text-dim)';
-      battSpan.title='No battery ADC wired — add voltage divider to free GPIO';
-    }
-
     // ArUco tag indicator
     const aTag=document.getElementById('arucoTag');
     if(d.aruco_room){aTag.style.display='inline-block';aTag.textContent='\u25c6 '+d.aruco_room;}
@@ -1216,6 +1257,13 @@ def start_dashboard():
 def set_vision_module(vision):
     with state.lock:
         state.vision_module = vision
+
+
+def set_pico_hw(hw):
+    """Register the PicoHardwareModule so /api/servo can dispatch to it
+    directly, bypassing the agent's manual-cmd queue."""
+    with state.lock:
+        state.pico_hw = hw
 
 
 def update_dashboard(frame=None, map_str=None, log_msg=None, **kwargs):

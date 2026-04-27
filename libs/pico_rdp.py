@@ -133,31 +133,24 @@ class Motor():
     
     @power.setter
     def power(self, power):
+        # Complementary-PWM H-bridge: pin_2 stays high (0xffff), pin_1 modulates.
+        # Motor sees +Vbat when pin_1 is low → pin_1 duty = 1 - motor_duty.
+        # Input range 0-100 → motor duty 20-100% (the 20% floor overcomes the
+        # motor's static-friction deadband; below that the wheels won't budge).
         self._power = power
-        dir = -1 if power < 0 else 1
-        value = abs(power)
-        if value != 0:
-            value = mapping(value, 0, 100, 30, 100)
-        else:
-            value = 0
-        value = int(value / 100.0 * 0xffff)
-
-        dir *= self.dir
         if power == 0:
-            value = 0
-        else:
-            value = mapping(abs(power), 0, 100, 20, 100)
-        value = int(value / 100.0 * 0xffff)
-        value = 0xffff - value
-        if dir > 0:
-            self.pin_1.duty_u16(value)
-            self.pin_2.duty_u16(0xffff)
-        elif dir < 0:
             self.pin_1.duty_u16(0xffff)
-            self.pin_2.duty_u16(value)
+            self.pin_2.duty_u16(0xffff)  # both high = brake
+            return
+        motor_pct = mapping(abs(power), 0, 100, 20, 100)
+        pin1_value = 0xffff - int(motor_pct / 100.0 * 0xffff)
+        direction = (-1 if power < 0 else 1) * self.dir
+        if direction > 0:
+            self.pin_1.duty_u16(pin1_value)
+            self.pin_2.duty_u16(0xffff)
         else:
             self.pin_1.duty_u16(0xffff)
-            self.pin_2.duty_u16(0xffff)
+            self.pin_2.duty_u16(pin1_value)
 
     def set_motor_power(self, power):
         self.power = power

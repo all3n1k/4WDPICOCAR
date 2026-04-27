@@ -15,10 +15,10 @@ CMD_TIMEOUT_MS = 2000
 car.stop()
 car.servo.set_angle(SERVO_OFFSET)
 
-# Battery voltage: GP29/ADC3 reads Pico's own VSYS rail (~3.3V regulated),
-# NOT the robot battery. No battery ADC is wired on this PCB.
-# Stub returns 0.0 so the dashboard shows '---' until a real divider is wired.
-def read_battery_v(): return 0.0
+# No battery ADC is wired on this board (GP29/ADC3 reads VSYS, not the
+# battery). The agent prompt and dashboard treat the bot as having no
+# battery sense — `read_battery_v` removed; if a divider is added later,
+# re-introduce a sensor module rather than a stub.
 
 # SoftI2C is used for both sensors. Hardware I2C peripheral on this MicroPython
 # build (v1.28.0) fails clock-stretched register reads with EIO on every freq;
@@ -90,10 +90,13 @@ pan_angle = 0    # target angle -90..90, maps to GP20
 tilt_angle = 0   # target angle -90..90, maps to GP21
 pan_current = 0  # actual current angle (interpolated)
 tilt_current = 0 # actual current angle (interpolated)
-# Interpolation: 1° per 5ms tick = 200°/s. Roughly 4× the 50°/s the dashboard
-# arrow keys drive at, so we always catch up between sends but without the
-# whip-crack feel of the old 400°/s.
-SERVO_INTERP_STEP = 1
+# Interpolation step per main-loop tick. The main loop's effective period is
+# ~10ms typical, ~20ms on sensor-read ticks (sonar/TOF). 5°/tick = ~500°/s
+# average, ~250°/s worst case — still 2-4× the dashboard arrow rate (125°/s),
+# so the Pico always catches up between sends and any in-flight gap at key
+# release drains in ≤10ms (invisible). SG90 mechanical max is ~600°/s, so 5°
+# per ~10ms is within spec.
+SERVO_INTERP_STEP = 5
 # Deadband on incoming targets — small jitter from the brain or the WS pipe
 # would otherwise twitch the servo every tick.
 SERVO_DEADBAND = 2
@@ -189,12 +192,16 @@ def on_receive(data):
         # 4. Pan/Tilt Head Servos — store angle, main loop applies it.
         # Deadband ignores micro-changes (LLM tune_parameters jitter, WS noise,
         # arrow-key auto-repeat) so the servo doesn't twitch on every packet.
+        # Clamp to ±75° (not ±90°). SG90s buzz/dither when commanded into the
+        # last ~15° of their mechanical range — the motor fights the end-stop
+        # and the internal control loop hunts. Keeping a 15° safety margin
+        # eliminates the jitter at the extremes.
         if 'S20' in data:
-            new_pan = max(-90, min(90, int(data['S20']) - 90))
+            new_pan = max(-75, min(75, int(data['S20']) - 90))
             if abs(new_pan - pan_angle) >= SERVO_DEADBAND:
                 pan_angle = new_pan
         if 'S21' in data:
-            new_tilt = max(-90, min(90, int(data['S21']) - 90))
+            new_tilt = max(-75, min(75, int(data['S21']) - 90))
             if abs(new_tilt - tilt_angle) >= SERVO_DEADBAND:
                 tilt_angle = new_tilt
         
@@ -307,7 +314,6 @@ while True:
                 ws.send_dict['C'] = car.speed.mileage
                 ws.send_dict['D'] = current_radar_sweep
                 ws.send_dict['H'] = car.get_grayscale_values()
-                ws.send_dict['V'] = read_battery_v()
                 if HAS_IMU:
                     ws.send_dict['I'] = imu.get_telemetry()
             except Exception as e:

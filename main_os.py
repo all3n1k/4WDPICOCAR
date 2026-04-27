@@ -107,8 +107,9 @@ def main():
         )
         mapper.run()
     else:
-        from dimos_lite.dashboard import set_vision_module
+        from dimos_lite.dashboard import set_vision_module, set_pico_hw
         set_vision_module(vision)
+        set_pico_hw(hardware)
         print("[OS] Dashboard: http://localhost:8080")
         brain.start()
 

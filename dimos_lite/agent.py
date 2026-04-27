@@ -18,8 +18,13 @@ COLLISION_EMERGENCY = 10
 COLLISION_WIDE_ANGLE = 50
 COLLISION_WIDE_DIST = 15
 MOVEMENT_SPEED = 70
-TURN_SPEED = 70
-MANUAL_SPEED = 75
+# Manual control speeds. The Pico's motor mapping is duty% = 20 + 0.8*input
+# (libs/pico_rdp.py:Motor.power), so input=50 → 60% duty, input=100 → 100% duty.
+# Cruise is intentionally below max so Shift = boost has real headroom (60→100%
+# = 40pt motor-duty jump, audibly and visibly faster).
+TURN_SPEED = 60   # in-place spins need a bit more torque than rolling
+MANUAL_SPEED = 50 # forward/backward cruise
+BOOST_SPEED = 100 # Shift+WASD = full throttle
 MANUAL_COOLDOWN_SEC = 30  # Stage B (interim): how long the think loop stands
                           # down after the human's last input. Prevents the
                           # autonomous brain from racing WASD/arrows on the WS
@@ -301,7 +306,6 @@ class AgentCoreModule(Module):
         self._imu_gyro_z = 0.0
         self._imu_accel = [0.0, 0.0, 0.0]
         self._has_imu = False
-        self._battery_v = 0.0
         self._speed = 0.0
         self._tof_distance = None
         self._last_detections = []
@@ -338,8 +342,6 @@ class AgentCoreModule(Module):
         self.grayscale_line.subscribe(self._on_grayscale)
         self.imu_data = StreamIn("imu_data")
         self.imu_data.subscribe(self._on_imu)
-        self.battery_voltage = StreamIn("battery_voltage")
-        self.battery_voltage.subscribe(self._on_battery)
         self.speed_cm_s = StreamIn("speed_cm_s")
         self.speed_cm_s.subscribe(self._on_speed)
         self.tof_distance = StreamIn("tof_distance")
@@ -365,7 +367,6 @@ class AgentCoreModule(Module):
                     "has_imu": self._has_imu,
                     "imu_gyro_z": self._imu_gyro_z,
                     "imu_accel": self._imu_accel,
-                    "battery_v": self._battery_v,
                     "tof_distance": self._tof_distance,
                     "robot_x": self._localization.robot_x if self._localization else 350,
                     "robot_y": self._localization.robot_y if self._localization else 350,
@@ -481,10 +482,6 @@ class AgentCoreModule(Module):
     def _on_speed(self, speed):
         with self._sensor_lock:
             self._speed = speed
-
-    def _on_battery(self, voltage):
-        with self._sensor_lock:
-            self._battery_v = float(voltage)
 
     def _on_tof(self, distance):
         with self._sensor_lock:
@@ -780,7 +777,6 @@ class AgentCoreModule(Module):
         with self._sensor_lock:
             dist = self._forward_dist
             gs = self._grayscale
-            batt = self._battery_v
             aruco = [h[0] for h in self._aruco_detections]
             detections = list(self._last_detections)
 
@@ -813,7 +809,6 @@ What I perceive right now:
 - The cells immediately around me on the grid: north={neighbors['N']}, south={neighbors['S']}, east={neighbors['E']}, west={neighbors['W']} ('W' is an obstacle, '.' is open).
 - My camera sees: {objects}.
 - ArUco markers in view: {aruco_str}.
-- Battery: {batt:.1f}V.
 
 What I was just thinking:
 {recent_thoughts}
@@ -945,28 +940,37 @@ I respond with a single JSON object and nothing else:
         while self._running:
             self.tick += 1
 
-            # Faster loop for better manual response
-            self._plan_ready.wait(timeout=0.05)
+            # Tight loop for manual response. Manual commands (WASD/arrows)
+            # land in state.manual_cmds via HTTP and need to drain promptly —
+            # a 10ms poll keeps human-perceived lag <15ms while still letting
+            # the planning thread set _plan_ready to break us out early.
+            self._plan_ready.wait(timeout=0.01)
             self._plan_ready.clear()
 
-            # Manual override — direct passthrough, high priority
+            # Manual override — direct passthrough, high priority.
+            # Servo commands (S20/S21 — pan/tilt head) NO LONGER come through
+            # this queue. The dashboard now dispatches them directly to the
+            # PicoHardwareModule via state.pico_hw, bypassing the agent loop
+            # entirely (see dashboard.py /api/servo). Only WASD-style movement
+            # commands hit this path because the brain wants to know about
+            # them (cooldown timer, mood update, action log).
             manual_processed = False
             while True:
                 manual = get_manual_command()
                 if not manual:
                     break
                 manual_processed = True
-                if manual.startswith("S"):
-                    # Handle direct servo commands e.g. "S21 90"
-                    parts = manual.split()
-                    pin = parts[0]
-                    angle = int(parts[1])
-                    print(f"[{self.name}] MANUAL SERVO -> publish({pin}, {angle})")
-                    self.cmd_vel.publish((pin, angle))
+                # Shift-modified commands arrive with a "_boost" suffix from
+                # the dashboard. Strip it and dispatch at full throttle.
+                if manual.endswith("_boost"):
+                    base = manual[:-len("_boost")]
+                    self.cmd_vel.publish((base, BOOST_SPEED))
+                    self._set_leds(bottom=[40, 0, 40])  # magenta tint = boost
+                    manual = base                       # for cooldown / brain log
                 else:
                     speed = TURN_SPEED if manual in ("left", "right") else MANUAL_SPEED
                     self.cmd_vel.publish((manual, speed if manual != "stop" else 0))
-                    self._set_leds(bottom=[0, 40, 40]) # Cyan for manual
+                    self._set_leds(bottom=[0, 40, 40])  # cyan = normal manual
 
                 # Mark the time of the most recent human input. The think loop
                 # checks this and stands down for MANUAL_COOLDOWN_SEC to keep
@@ -1014,22 +1018,13 @@ I respond with a single JSON object and nothing else:
         
         start_t = time.time()
         while (time.time() - start_t) < duration and self._running:
-            # Drain manual commands. Servo commands (S20/S21 — pan/tilt) are
-            # passthrough: dispatch them inline so the user can look around
-            # without interrupting the active drive action. Drive commands
-            # (forward/backward/left/right/stop) are real interrupts.
+            # Drain manual movement commands. Servo (S*) commands no longer
+            # appear in this queue — they go direct from dashboard to Pico.
+            # Any movement command from the user is treated as an interrupt.
             manual = get_manual_command()
             if manual:
-                if manual.startswith("S"):
-                    parts = manual.split()
-                    if len(parts) == 2:
-                        try:
-                            self.cmd_vel.publish((parts[0], int(parts[1])))
-                        except ValueError:
-                            pass
-                else:
-                    print(f"[{self.name}] AI action {action} interrupted")
-                    break
+                print(f"[{self.name}] AI action {action} interrupted")
+                break
             
             # Check for emergency stop
             if action == "forward" and self._emergency_stop:
@@ -1065,7 +1060,6 @@ I respond with a single JSON object and nothing else:
             imu_gyro_z = self._imu_gyro_z
             imu_accel = list(self._imu_accel)
             has_imu = self._has_imu
-            battery_v = self._battery_v
             tof_distance = self._tof_distance
         with self._brain_lock:
             brain = dict(self._brain)
@@ -1113,6 +1107,5 @@ I respond with a single JSON object and nothing else:
             reasoning=brain.get("reasoning", ""),
             latency=brain.get("latency", 0),
             latency_avg=brain.get("latency_avg", 0),
-            battery_v=battery_v,
             tof_distance=tof_distance,
         )

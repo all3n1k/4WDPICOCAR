@@ -20,7 +20,6 @@ class PicoHardwareModule(Module):
         self.odometry = StreamOut("odometry")
         self.speed_cm_s = StreamOut("speed_cm_s")
         self.imu_data = StreamOut("imu_data")
-        self.battery_voltage = StreamOut("battery_voltage")
         self.tof_distance = StreamOut("tof_distance")
 
         self.cmd_vel = StreamIn("cmd_vel")
@@ -54,8 +53,6 @@ class PicoHardwareModule(Module):
                 self.speed_cm_s.publish(data['B']) # Added B publish
             if 'I' in data:
                 self.imu_data.publish(data['I'])
-            if 'V' in data:
-                self.battery_voltage.publish(float(data['V']))
             if 'T' in data:
                 v = data['T']
                 self.tof_distance.publish(float(v) if v is not None else None)

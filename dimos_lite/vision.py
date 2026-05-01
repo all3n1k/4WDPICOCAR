@@ -94,7 +94,7 @@ class VisionModule(Module):
                             frame = cv2.flip(frame, 0) # Vertical flip only (removes mirroring)
                             
                             # YOLOv8 Detection
-                            results = self._model(frame, stream=True, verbose=False, device=self._device)
+                            results = self._model(frame, stream=False, verbose=False, device=self._device)
                             current_detections = []
                             for r in results:
                                 for box in r.boxes:

@@ -91,9 +91,12 @@ class PicoHardwareModule(Module):
         threading.Thread(target=run_ws, daemon=True).start()
 
     def _on_cmd_vel(self, data):
-        if not self._connected:
-            return
+        with self._lock:
+            if not self._connected or not self._ws:
+                return
+            ws = self._ws
         
+
         # New: Handle dictionary payloads (LEDs, Servo, etc.) directly
         if isinstance(data, dict):
             payload = data
@@ -117,8 +120,6 @@ class PicoHardwareModule(Module):
             else:
                 return
 
-        with self._lock:
-            ws = self._ws
         if ws:
             try:
                 ws.send(json.dumps(payload))

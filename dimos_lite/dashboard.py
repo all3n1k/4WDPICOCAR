@@ -107,7 +107,22 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode())
             cmd = body.get('command')
             with state.lock:
-                state.manual_cmds.append(cmd)
+                # `stop` is a kill-switch, never a queue entry. The moment
+                # one arrives, throw away everything else and queue ONLY the
+                # stop. Without this, a sequence like [forward, forward,
+                # ..., stop] gets drained FIFO and the robot runs forward
+                # for the full drain duration after the user releases the
+                # key. With this, release → next agent tick sees only stop
+                # → motors halt within ~10-20ms of release.
+                if cmd == 'stop':
+                    state.manual_cmds = ['stop']
+                else:
+                    state.manual_cmds.append(cmd)
+                    # Bound the queue. WASD keys send every 80ms while held;
+                    # if drain rate falls behind, queue must not grow
+                    # unbounded. 8 entries ≈ 640ms of buffered commands.
+                    if len(state.manual_cmds) > 8:
+                        state.manual_cmds = state.manual_cmds[-4:]
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -314,9 +329,13 @@ body{background:var(--bg);color:var(--text);font-family:'Inter','SF Pro Display'
    panels below always get a usable share of the column. */
 .video-panel{flex:0 0 auto;width:100%;aspect-ratio:4/3;max-height:60vh;min-height:0}
 .video-panel .panel-body{background:#000;display:flex;justify-content:center;align-items:center;padding:0;overflow:hidden}
-.video-panel img{width:100%;height:100%;object-fit:contain;background:#000;image-rendering:pixelated}
-.brain-panel{flex:1 1 420px;min-height:420px}
-.brain-panel .panel-body{overflow-y:auto}
+/* object-fit:cover fills the panel and crops slightly if the stream aspect
+   doesn't match. This kills the black bars that appeared when the dynamic
+   aspect-ratio JS couldn't get naturalWidth from MJPEG streams in some
+   browsers. Slight crop is acceptable; black bars are not. */
+.video-panel img{width:100%;height:100%;object-fit:cover;background:#000;image-rendering:pixelated}
+.brain-panel{flex:1 1 280px;min-height:160px}
+.brain-panel .panel-body{overflow-y:auto;-webkit-overflow-scrolling:touch}
 .radar-panel{flex:0 0 280px;min-height:140px}
 .radar-panel .panel-body{padding:0;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
 .map-panel{flex:1;min-height:120px}
@@ -1075,7 +1094,13 @@ fpCanvas.onclick=async e=>{
     });
 
     const px=ox+smoothX*s,py=oy+smoothY*s;
-    const hdg=smoothHdg*Math.PI/180;
+    // Apply apartment-frame offset. The IMU emits compass-frame heading
+    // (0° = real-world north) but the floorplan PNG was captured with its
+    // top wall facing real-world ~205° SW. To draw the arrow in a way that
+    // matches what the user sees physically, subtract the offset so the
+    // arrow direction on canvas equals real-world direction.
+    const APARTMENT_FRAME_OFFSET_DEG = 205;
+    const hdg=(smoothHdg - APARTMENT_FRAME_OFFSET_DEG)*Math.PI/180;
 
     // Heading line
     fpCtx.beginPath();fpCtx.moveTo(px,py);
@@ -1154,8 +1179,10 @@ async function poll(){
     const distBar=document.getElementById('distBar');
     distBar.style.width=distPct+'%';
     distBar.style.background=d.forward_dist<30?'var(--danger)':d.forward_dist<60?'var(--warn)':'var(--ok)';
-    // Laser tile (VL53L0X). tof_distance is null when out-of-range.
-    const tofVal=(d.tof_distance==null)?'---':d.tof_distance.toFixed(1)+' cm';
+    // Laser tile (VL53L0X). When null we say "OOR" — clear path beyond
+    // ~2m max range OR the surface is non-reflective at this angle. NOT a
+    // sensor failure; the dashboard used to show '---' which read as broken.
+    const tofVal=(d.tof_distance==null)?'OOR (>2m / no return)':d.tof_distance.toFixed(1)+' cm';
     document.getElementById('brainTof').textContent=tofVal;
     const tofBar=document.getElementById('tofBar');
     if(d.tof_distance==null){tofBar.style.width='0';}

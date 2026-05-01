@@ -4,6 +4,15 @@ main_os.py — dimOS-lite entry point
 Normal mode:        python3 main_os.py
 Autonomous map:     python3 main_os.py --map
 Cartographer pass:  python3 main_os.py --carto
+
+Runtime state policy: every boot wipes semantic_map.json (obstacle cloud)
+and constellation_map.json (auto-discovered marker positions). The robot
+may have been physically picked up and moved while powered down, so prior
+sensor data is presumed stale. User-surveyed wall markers (room_markers.json)
+and the static apartment prior (apartment_map.py) are always preserved.
+
+Pass --continue to keep last session's runtime state instead — useful if
+the robot stayed put and you want to resume mapping where you left off.
 """
 
 import sys
@@ -26,6 +35,40 @@ MAP_FILE = os.path.join(os.path.dirname(__file__), 'apartment_map.py')
 MAPPING_MODE = '--map' in sys.argv
 CARTO_MODE = '--carto' in sys.argv
 CONSTELLATION_MODE = '--constellation' in sys.argv
+# Default: discard runtime sensor state on every boot so a robot that was
+# moved while powered down doesn't smear its old obstacle cloud onto the new
+# location. Pass --continue to keep the prior session's data instead.
+CONTINUE_MODE = '--continue' in sys.argv
+# The autonomous LLM brain (think loop) is OPT-IN. Without --auto, the dashboard,
+# manual control, sensor streams, and reflex safety thread all run normally —
+# but the LLM never speaks, plans, or issues tool calls. This makes it safe to
+# bring up the robot for testing/calibration without the model immediately
+# trying to drive around.
+AUTO_MODE = '--auto' in sys.argv
+
+# Files that hold runtime sensor data (cleared on boot unless --continue).
+# room_markers.json and apartment_map.py are configuration, not sensor data,
+# and are always preserved.
+RUNTIME_STATE_FILES = ('semantic_map.json', 'constellation_map.json')
+
+
+def reset_runtime_state():
+    """Delete persisted obstacle map + auto-discovered marker positions so the
+    robot wakes up with no preconceptions about where it is or what's around it.
+    Called by default; skipped under --continue."""
+    cleared = []
+    for name in RUNTIME_STATE_FILES:
+        path = os.path.join(os.path.dirname(__file__), name)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                cleared.append(name)
+            except OSError as e:
+                print(f"[OS] Could not remove {name}: {e}")
+    if cleared:
+        print(f"[OS] Fresh runtime state — cleared: {', '.join(cleared)}")
+    else:
+        print("[OS] Fresh runtime state — nothing to clear")
 
 def load_prior_map():
     if not os.path.exists(MAP_FILE):
@@ -59,10 +102,16 @@ def main():
         print("  *** CARTOGRAPHER MODE ***")
     if CONSTELLATION_MODE:
         print("  *** CONSTELLATION DISCOVERY MODE ***")
+    if CONTINUE_MODE:
+        print("  *** --continue: preserving prior session state ***")
     print("=" * 48 + "\n")
 
+    if not CONTINUE_MODE:
+        reset_runtime_state()
+
     loc = LocalizationModule()
-    loc.load_constellation()
+    if CONTINUE_MODE:
+        loc.load_constellation()
     loc.start()
 
     vision = VisionModule(stream_url="http://192.168.1.210/stream")
@@ -77,12 +126,19 @@ def main():
     prior_map = load_prior_map()
     brain = AgentCoreModule(
         ollama_url="http://digitalstorm:11434/api/generate",
-        model="gemma4:31b",
+        model="gemma4:26b",
         prior_map=prior_map,
         localization=loc,
         discovery_mode=CONSTELLATION_MODE,
+        auto=AUTO_MODE,
     )
-    brain.semantic_map.load_from_disk()
+    if AUTO_MODE:
+        print("[OS] --auto: LLM brain ENABLED — robot will think and drive autonomously")
+    else:
+        print("[OS] LLM brain DISABLED (no --auto flag). Manual control + sensors + reflex only.")
+        print("[OS] Pass --auto to activate the autonomous LLM.")
+    if CONTINUE_MODE:
+        brain.semantic_map.load_from_disk()
 
     autoconnect(vision, hardware, brain)
 

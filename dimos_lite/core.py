@@ -24,15 +24,15 @@ class StreamIn:
         self._callback = None
 
     def put(self, data):
-        if self._q.full():
+        while True:
             try:
-                self._q.get_nowait()
-            except queue.Empty:
-                pass
-        try:
-            self._q.put_nowait(data)
-        except queue.Full:
-            pass
+                self._q.put_nowait(data)
+                break
+            except queue.Full:
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    pass
 
     def subscribe(self, callback):
         self._callback = callback

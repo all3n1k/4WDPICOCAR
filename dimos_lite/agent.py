@@ -13,18 +13,14 @@ from dimos_lite.aruco import ArucoDetector, HAS_ARUCO
 from dimos_lite.floorplan import MARKER_TO_ROOM
 
 # --- Global Constants ---
-COLLISION_THRESHOLD = 25
-COLLISION_EMERGENCY = 10
+COLLISION_THRESHOLD = 27
+COLLISION_EMERGENCY = 12
 COLLISION_WIDE_ANGLE = 50
-COLLISION_WIDE_DIST = 15
+COLLISION_WIDE_DIST = 10
 MOVEMENT_SPEED = 70
-# Manual control speeds. The Pico's motor mapping is duty% = 20 + 0.8*input
-# (libs/pico_rdp.py:Motor.power), so input=50 → 60% duty, input=100 → 100% duty.
-# Cruise is intentionally below max so Shift = boost has real headroom (60→100%
-# = 40pt motor-duty jump, audibly and visibly faster).
-TURN_SPEED = 60   # in-place spins need a bit more torque than rolling
-MANUAL_SPEED = 50 # forward/backward cruise
-BOOST_SPEED = 100 # Shift+WASD = full throttle
+TURN_SPEED = 70
+MANUAL_SPEED = 75
+BOOST_SPEED = 100  # Shift+WASD on the dashboard — full-throttle override
 MANUAL_COOLDOWN_SEC = 30  # Stage B (interim): how long the think loop stands
                           # down after the human's last input. Prevents the
                           # autonomous brain from racing WASD/arrows on the WS
@@ -274,13 +270,20 @@ TOOLS = [
 class AgentCoreModule(Module):
 
     def __init__(self, ollama_url="http://localhost:11434/api/generate",
-                 model="gemma4:e4b", prior_map=None, localization=None, discovery_mode=False):
+                 model="gemma4:e4b", prior_map=None, localization=None,
+                 discovery_mode=False, auto=False):
         super().__init__("AgentCore")
         self.ollama_url = ollama_url
         self.model = model
         self._localization = localization
         self._aruco = ArucoDetector() if HAS_ARUCO else None
         self._discovery_mode = discovery_mode
+        # Autonomous-brain gate. When False, the think loop never starts —
+        # the LLM neither plans nor speaks. Sensor streams, manual control,
+        # the reflex safety thread, and the dashboard all still run, so the
+        # robot is fully usable for testing/calibration without the model
+        # immediately trying to drive around. Toggled by `main_os.py --auto`.
+        self._auto = auto
         
         if self._localization:
             self._localization.load_constellation()
@@ -306,6 +309,7 @@ class AgentCoreModule(Module):
         self._imu_gyro_z = 0.0
         self._imu_accel = [0.0, 0.0, 0.0]
         self._has_imu = False
+        self._battery_v = 0.0
         self._speed = 0.0
         self._tof_distance = None
         self._last_detections = []
@@ -329,6 +333,23 @@ class AgentCoreModule(Module):
         self._last_tool_result = ""
         self._latencies = deque(maxlen=20)
         self._last_manual_ts = 0.0  # Stage B (interim): cooldown anchor
+        # Reflex stop hysteresis: a single clear reading isn't enough to
+        # release the stop because sweeping sensors flicker between "see
+        # obstacle" and "missed it" mid-collision. Require 5 consecutive
+        # clear ticks (~200ms at 25Hz) AND a minimum 500ms post-trigger
+        # hold before re-enabling motion.
+        self._reflex_clear_count = 0
+        self._reflex_close_count = 0     # consecutive ticks reading close
+        self._reflex_held_until = 0.0
+        # Sync-dashboard rate-limit. The main control loop fires ~100Hz, but
+        # the dashboard JS only polls at ~3Hz. _sync_dashboard builds the
+        # full telemetry dict (including get_obstacles() over a 5041-cell
+        # grid) and writes through state.lock. Without rate-limiting it eats
+        # main-thread CPU and contends the dashboard lock with the dedicated
+        # 10Hz _dashboard_loop thread, both of which delay the manual-cmd
+        # drain → input lag scales with session length. Cap to 10Hz here.
+        self._last_sync_ts = 0.0
+        self._SYNC_MIN_INTERVAL = 0.1
 
         # --- Streams ---
         self.cmd_vel = StreamOut("cmd_vel")
@@ -342,6 +363,8 @@ class AgentCoreModule(Module):
         self.grayscale_line.subscribe(self._on_grayscale)
         self.imu_data = StreamIn("imu_data")
         self.imu_data.subscribe(self._on_imu)
+        self.battery_voltage = StreamIn("battery_voltage")
+        self.battery_voltage.subscribe(self._on_battery)
         self.speed_cm_s = StreamIn("speed_cm_s")
         self.speed_cm_s.subscribe(self._on_speed)
         self.tof_distance = StreamIn("tof_distance")
@@ -367,6 +390,7 @@ class AgentCoreModule(Module):
                     "has_imu": self._has_imu,
                     "imu_gyro_z": self._imu_gyro_z,
                     "imu_accel": self._imu_accel,
+                    "battery_v": self._battery_v,
                     "tof_distance": self._tof_distance,
                     "robot_x": self._localization.robot_x if self._localization else 350,
                     "robot_y": self._localization.robot_y if self._localization else 350,
@@ -483,6 +507,10 @@ class AgentCoreModule(Module):
         with self._sensor_lock:
             self._speed = speed
 
+    def _on_battery(self, voltage):
+        with self._sensor_lock:
+            self._battery_v = float(voltage)
+
     def _on_tof(self, distance):
         with self._sensor_lock:
             self._tof_distance = None if distance is None else float(distance)
@@ -593,8 +621,13 @@ class AgentCoreModule(Module):
 
             if thought:
                 self._memory.append(thought)
-                if tool_calls and tool_calls[0].get("name") != "speak":
-                    self._speak_async(thought)
+                # Auto-speak of the thought is intentionally OFF. macOS `say`
+                # takes 5-10s per utterance; with the 26b model ticking ~1Hz,
+                # narrating every inner monologue piles up audio that can't
+                # be killed cleanly (the speech daemon keeps queued audio
+                # playing past process termination → overlapping voices).
+                # Only explicit `speak` tool calls vocalize now; everything
+                # else stays in the dashboard log.
 
             if tool_calls:
                 update_dashboard(log_msg=f"[PLAN] {thought[:60]}...")
@@ -607,10 +640,6 @@ class AgentCoreModule(Module):
                     res_str = self._execute_tool(t_name, t_args)
                     self._last_tool_result = res_str
                     update_dashboard(log_msg=f"[RESULT] {res_str}")
-
-                    # Sequential speech for results
-                    if t_name != "speak" and ("moved" in res_str.lower() or "turned" in res_str.lower()):
-                        self._speak_async(res_str)
             else:
                 self._last_tool_result = "No actions planned."
 
@@ -688,9 +717,9 @@ class AgentCoreModule(Module):
             center_min = 999
             
             for ang, dist in sweep:
-                if -15 <= ang <= 15: center_min = min(center_min, dist)
-                elif ang < -15: left_min = min(left_min, dist)
-                elif ang > 15: right_min = min(right_min, dist)
+                if -10 <= ang <= 10: center_min = min(center_min, dist)
+                elif ang < -10: left_min = min(left_min, dist)
+                elif ang > 10: right_min = min(right_min, dist)
             
             summary = (f"Left: {'CLEAR' if left_min > 50 else f'{left_min:.0f}cm'}, "
                        f"Center: {'CLEAR' if center_min > 50 else f'{center_min:.0f}cm'}, "
@@ -764,19 +793,29 @@ class AgentCoreModule(Module):
             self.cmd_vel.publish(payload)
 
     def _speak_async(self, text):
-        """Sequential speech using macOS 'say'."""
+        """Drop-if-busy speech. macOS `say` cannot be cleanly interrupted —
+        the speech-synthesis daemon keeps queued audio playing past SIGTERM,
+        which manifests as overlapping voices. So instead of interrupting,
+        we drop new utterances while one is still playing. Only one voice
+        plays at a time; rapid repeated calls are silently ignored."""
         import subprocess
-        def speak_thread():
-            with self._speech_lock:
-                # Strip special chars for 'say'
-                clean_text = text.replace('"', '').replace("'", "").replace("{", "").replace("}", "")
-                subprocess.run(["say", "-v", "Samantha", "-r", "180", clean_text])
-        threading.Thread(target=speak_thread, daemon=True).start()
+        clean_text = text.replace('"', '').replace("'", "").replace("{", "").replace("}", "").strip()
+        if not clean_text:
+            return
+        with self._speech_lock:
+            prev = getattr(self, "_speak_proc", None)
+            if prev is not None and prev.poll() is None:
+                # Old utterance still playing — drop the new one.
+                return
+            self._speak_proc = subprocess.Popen(
+                ["say", "-v", "Samantha", "-r", "180", clean_text]
+            )
 
     def _build_prompt(self):
         with self._sensor_lock:
             dist = self._forward_dist
             gs = self._grayscale
+            batt = self._battery_v
             aruco = [h[0] for h in self._aruco_detections]
             detections = list(self._last_detections)
 
@@ -784,8 +823,8 @@ class AgentCoreModule(Module):
         zone = self._localization.get_zone() if self._localization else "an unknown room"
         rx, ry = self.semantic_map.x, self.semantic_map.y
         heading = self.semantic_map.heading
-        left_dist = self._get_min_dist(-90, -15)
-        right_dist = self._get_min_dist(15, 90)
+        left_dist = self._get_min_dist(-90, -10)
+        right_dist = self._get_min_dist(10, 90)
         objects = ", ".join(f"{d['label']} ({d['confidence']*100:.0f}%)" for d in detections) if detections else "nothing notable"
         aruco_str = ", ".join(str(a) for a in aruco) if aruco else "no markers"
         recent_thoughts = "\n".join(f"  - {m}" for m in self._memory) if self._memory else "  - (nothing recent)"
@@ -809,6 +848,7 @@ What I perceive right now:
 - The cells immediately around me on the grid: north={neighbors['N']}, south={neighbors['S']}, east={neighbors['E']}, west={neighbors['W']} ('W' is an obstacle, '.' is open).
 - My camera sees: {objects}.
 - ArUco markers in view: {aruco_str}.
+- Battery: {batt:.1f}V.
 
 What I was just thinking:
 {recent_thoughts}
@@ -910,59 +950,94 @@ I respond with a single JSON object and nothing else:
                     should_stop = True
                     reason = f"TURN EMERGENCY {dist:.0f}cm"
 
+            # Multi-tick confirmation. Real obstacles give consistent close
+            # readings every tick; sonar/laser false-positives (glazed-floor
+            # specular reflection, single-bounce ghosts) are 1-2 isolated
+            # ticks. Require 3 consecutive close ticks before triggering so
+            # noise doesn't cause repeated stop publishes that would race
+            # the manual `forward` commands on the WS pipe and cause stutter.
             if should_stop:
+                self._reflex_close_count += 1
+            else:
+                self._reflex_close_count = 0
+
+            confirmed_stop = self._reflex_close_count >= 3
+
+            if confirmed_stop:
                 if not self._emergency_stop:
                     print(f"[{self.name}] REFLEX STOP: {reason}")
                     self.cmd_vel.publish(("stop", 0))
                     self._set_leds(rear=[100, 0, 0], bottom=[60, 0, 0]) # Bright red danger
                     self._emergency_stop = True
+                # Re-arm hold each tick the obstacle is still confirmed.
+                self._reflex_held_until = time.time() + 0.2
+                self._reflex_clear_count = 0
             else:
                 if self._emergency_stop:
-                    self._set_leds(rear=[0, 0, 0], bottom=[0, 0, 0]) # Clear danger
-                self._emergency_stop = False
+                    # Release after 3 consecutive clear ticks (~120ms) AND
+                    # the 200ms post-trigger hold has elapsed. Faster recovery
+                    # than the prior 500ms/5-tick combo — a real obstacle
+                    # will keep retriggering its own confirmation, so the
+                    # short hold is safe.
+                    self._reflex_clear_count += 1
+                    if (self._reflex_clear_count >= 3 and
+                            time.time() >= self._reflex_held_until):
+                        self._set_leds(rear=[0, 0, 0], bottom=[0, 0, 0])
+                        self._emergency_stop = False
+                        self._reflex_clear_count = 0
+                else:
+                    self._reflex_clear_count = 0
             time.sleep(0.04)
 
     # ── Control Loop (Main Thread) ───────────────────────────
 
     def start(self):
-        print(f"[{self.name}] Online. Model: {self.model}")
+        mode = "AUTO" if self._auto else "MANUAL ONLY"
+        print(f"[{self.name}] Online. Model: {self.model} ({mode})")
         start_dashboard()
         self._running = True
-        
+
         # Initial LED flash to confirm connection
         self._set_leds(bottom=[40, 40, 40], rear=[40, 40, 40])
         time.sleep(0.5)
         self._set_leds(bottom=[0, 0, 0], rear=[0, 0, 0])
 
-        threading.Thread(target=self._think_loop, daemon=True).start()
+        # Reflex (safety) and the main control loop always run — they handle
+        # emergency stops and manual command dispatch. The think loop (the
+        # autonomous LLM) only starts when explicitly enabled via --auto.
+        if self._auto:
+            threading.Thread(target=self._think_loop, daemon=True).start()
+        else:
+            print(f"[{self.name}] Think loop NOT started — pass --auto to enable")
         threading.Thread(target=self._reflex_loop, daemon=True).start()
 
         while self._running:
             self.tick += 1
 
-            # Tight loop for manual response. Manual commands (WASD/arrows)
-            # land in state.manual_cmds via HTTP and need to drain promptly —
-            # a 10ms poll keeps human-perceived lag <15ms while still letting
-            # the planning thread set _plan_ready to break us out early.
-            self._plan_ready.wait(timeout=0.01)
+            # Faster loop for better manual response
+            self._plan_ready.wait(timeout=0.05)
             self._plan_ready.clear()
 
-            # Manual override — direct passthrough, high priority.
-            # Servo commands (S20/S21 — pan/tilt head) NO LONGER come through
-            # this queue. The dashboard now dispatches them directly to the
-            # PicoHardwareModule via state.pico_hw, bypassing the agent loop
-            # entirely (see dashboard.py /api/servo). Only WASD-style movement
-            # commands hit this path because the brain wants to know about
-            # them (cooldown timer, mood update, action log).
+            # Manual override — direct passthrough, high priority
             manual_processed = False
             while True:
                 manual = get_manual_command()
                 if not manual:
                     break
                 manual_processed = True
-                # Shift-modified commands arrive with a "_boost" suffix from
-                # the dashboard. Strip it and dispatch at full throttle.
-                if manual.endswith("_boost"):
+                if manual.startswith("S"):
+                    # Handle direct servo commands e.g. "S21 90"
+                    parts = manual.split()
+                    pin = parts[0]
+                    angle = int(parts[1])
+                    print(f"[{self.name}] MANUAL SERVO -> publish({pin}, {angle})")
+                    self.cmd_vel.publish((pin, angle))
+                elif manual.endswith("_boost"):
+                    # Shift+WASD path. Strip the suffix and dispatch at full
+                    # throttle. Without this branch, the literal string
+                    # "forward_boost" gets shipped through cmd_vel and the
+                    # Pico firmware silently drops it (no matching K key) —
+                    # motors never get a command and the robot looks dead.
                     base = manual[:-len("_boost")]
                     self.cmd_vel.publish((base, BOOST_SPEED))
                     self._set_leds(bottom=[40, 0, 40])  # magenta tint = boost
@@ -970,7 +1045,7 @@ I respond with a single JSON object and nothing else:
                 else:
                     speed = TURN_SPEED if manual in ("left", "right") else MANUAL_SPEED
                     self.cmd_vel.publish((manual, speed if manual != "stop" else 0))
-                    self._set_leds(bottom=[0, 40, 40])  # cyan = normal manual
+                    self._set_leds(bottom=[0, 40, 40]) # Cyan for manual
 
                 # Mark the time of the most recent human input. The think loop
                 # checks this and stands down for MANUAL_COOLDOWN_SEC to keep
@@ -1018,13 +1093,22 @@ I respond with a single JSON object and nothing else:
         
         start_t = time.time()
         while (time.time() - start_t) < duration and self._running:
-            # Drain manual movement commands. Servo (S*) commands no longer
-            # appear in this queue — they go direct from dashboard to Pico.
-            # Any movement command from the user is treated as an interrupt.
+            # Drain manual commands. Servo commands (S20/S21 — pan/tilt) are
+            # passthrough: dispatch them inline so the user can look around
+            # without interrupting the active drive action. Drive commands
+            # (forward/backward/left/right/stop) are real interrupts.
             manual = get_manual_command()
             if manual:
-                print(f"[{self.name}] AI action {action} interrupted")
-                break
+                if manual.startswith("S"):
+                    parts = manual.split()
+                    if len(parts) == 2:
+                        try:
+                            self.cmd_vel.publish((parts[0], int(parts[1])))
+                        except ValueError:
+                            pass
+                else:
+                    print(f"[{self.name}] AI action {action} interrupted")
+                    break
             
             # Check for emergency stop
             if action == "forward" and self._emergency_stop:
@@ -1048,6 +1132,15 @@ I respond with a single JSON object and nothing else:
             self._brain["action"] = "stop"
 
     def _sync_dashboard(self):
+        # Rate-limit. Main control loop calls this every iteration (~100Hz);
+        # dashboard polls at ~3Hz; _dashboard_loop pushes lighter telemetry
+        # at 10Hz. Anything more than 10Hz here is pure lock-contention +
+        # CPU waste, and shows up as compounding input lag on manual control.
+        now = time.time()
+        if now - self._last_sync_ts < self._SYNC_MIN_INTERVAL:
+            return
+        self._last_sync_ts = now
+
         with self._sensor_lock:
             dist = self._forward_dist
             sweep = list(self._radar_sweep)
@@ -1060,6 +1153,7 @@ I respond with a single JSON object and nothing else:
             imu_gyro_z = self._imu_gyro_z
             imu_accel = list(self._imu_accel)
             has_imu = self._has_imu
+            battery_v = self._battery_v
             tof_distance = self._tof_distance
         with self._brain_lock:
             brain = dict(self._brain)
@@ -1107,5 +1201,6 @@ I respond with a single JSON object and nothing else:
             reasoning=brain.get("reasoning", ""),
             latency=brain.get("latency", 0),
             latency_avg=brain.get("latency_avg", 0),
+            battery_v=battery_v,
             tof_distance=tof_distance,
         )

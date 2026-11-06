@@ -47,3 +47,9 @@ yolov8n.pt
 
 # Local scratch / test scripts (kept local, not part of public repo)
 scratch/
+
+# Local development context and working notes
+/.private-notes/
+
+# Per-device Wi-Fi configuration
+/secrets.py

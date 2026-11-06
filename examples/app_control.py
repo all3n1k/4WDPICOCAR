@@ -69,8 +69,11 @@ except Exception as e:
 
 NAME = 'Pico4WD'
 WIFI_MODE = "sta"
-SSID = "YOUR_WIFI_SSID"
-PASSWORD = "YOUR_WIFI_PASSWORD"
+try:
+    from secrets import WIFI_SSID as SSID, WIFI_PASSWORD as PASSWORD
+except ImportError:
+    raise RuntimeError("Copy examples/secrets.example.py to the Pico as secrets.py and set Wi-Fi credentials")
+
 time.sleep(3)
 ws = WS_Server(name=NAME, mode=WIFI_MODE, ssid=SSID, password=PASSWORD)
 ws.start()

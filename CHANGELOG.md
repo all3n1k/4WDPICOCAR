@@ -1,5 +1,6 @@
 # Changelog
 
+All notable changes to the Agent OS project are recorded here. Newest at the top. Keep entries dated (YYYY-MM-DD) and grouped by what shipped together. The README and operating guide describe setup; this file records changes.
 
 Format: loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning aligned with `docs/USER_GUIDE.md`.
 
@@ -30,6 +31,7 @@ Hardware-sweep + firmware regression repairs. A previous editor's VL53L0X integr
 
 ### Documentation
 
+- Corrected the GPIO map: MPU6050 uses GP0/GP1; VL53L0X uses GP2/GP3.
 
 ### Deferred / known limitations
 
@@ -46,6 +48,7 @@ Hardware-sweep + firmware regression repairs. A previous editor's VL53L0X integr
 
 ## [5.8.0-preM0] — 2026-04-24
 
+Stage M0 of the mapping/navigation roadmap : in-dashboard ArUco marker survey tool. The user can now visually pin all 27 physical markers (5 wall + 22 floor) onto the floor-plan canvas and persist their positions to disk.
 
 ### Added
 
@@ -73,11 +76,13 @@ User opens `http://localhost:8080`, clicks `📍 Survey`, pins all 27 markers (5
 
 ## [5.8.0-pre] — 2026-04-23
 
+Roadmap pivot, no code change. After running v5.7.0-preA on real hardware, the user observed the floor-plan map is fundamentally broken: robot dot teleports on ArUco sightings, obstacle cloud renders centred on the apartment middle (spilling into hall/bedroom regardless of where the robot actually is), and the position never matches physical truth. Diagnosis  identified four structural issues — two parallel pose estimators that don't share state, an obstacle frame anchored at apartment centre rather than world origin, obstacle insertion using the un-corrected pose, and discovery from a wrong initial pose pinning markers at fictional coords. The intelligence-layer stages B–F are parked; mapping/navigation (M0–M4) is now the active workstream. Goal: animal-equivalent spatial competence (pose drift ≤ ~30 cm over a 10-min session). Stage A remains shipped — the first-person prompt is independent of pose correctness and pays off once the map underneath it is real. M0 (marker survey tool) is the immediate unblocking step; the user has 27 ArUco markers physically placed and is ready to pin them.
 
 ---
 
 ## [5.7.0-preA] — 2026-04-23
 
+Stage A of the intelligence-layer roadmap : rewrite the LLM prompt as a first-person narrative.
 
 ### Changed
 
@@ -126,6 +131,7 @@ Cleanup sweep + mapping-pipeline repair. The robot can now run `--carto` as a pr
 ### Known issues / deferred
 
 - Cartographer still opens its own `cv2.namedWindow` for calibration (arrow keys + shift-click). The dashboard mini-map now mirrors the same information in the browser, so the cv2 window is redundant except for calibration input. Moving calibration controls into the dashboard is pending.
+- `SemanticMap` grid is 71×71 with 10 cm cells (~7.1 m × 7.1 m), not the 21×21 documented in earlier documentation.
 - `patch_self`, `reboot`, and `tune_parameters` remain in the agent's tool list. These are intentional — the 31B agent is being given self-modification as a first-class capability, not a safety oversight.
 
 ---
@@ -164,6 +170,7 @@ Bug-fix pass against v5.5. No feature additions.
 
 ### Docs
 
+- Added project status and change-history documentation.
 - Expanded `.gitignore` to cover pycache, macOS cruft, debug artifacts, and the 1 MB MicroPython binary.
 
 ---
@@ -177,6 +184,7 @@ Baseline for this changelog. Feature set from `docs/USER_GUIDE.md` header:
 - Vision HUD — AR-style bounding boxes and ID/Distance labels on stream.
 - Pose Estimation SLAM — exact distance/bearing snapping from ArUco markers.
 - Live SLAM Mapping — discovered obstacles appear as dots on dashboard _(never actually reached the UI until 5.5.1; see Fixed above)_.
+- PWM LED Overhaul — support for analog LEDs on Pins 19, 20, 21, 22 _(chassis strip on GP19 not currently lighting; see the current operating notes)_.
 - Turn Signals — automatic blinking headlamps (Fast=Left, Slow=Right).
 - LLM Stability — 90 s timeout and optimised token predict (512) for 31B model.
 

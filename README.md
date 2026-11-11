@@ -74,3 +74,14 @@ should run in a supervised development environment.
 Known limitations include sensor noise, pose drift, and camera firmware variants
 that only support binary LED control. The code is not a guarantee of collision
 avoidance.
+
+## Dashboard access
+
+The dashboard binds to loopback by default. For access through a private remote
+interface, explicitly set `DASHBOARD_HOST`, `DASHBOARD_ALLOWED_HOSTS` (comma-separated
+request hostnames), and a random `DASHBOARD_TOKEN` of at least 24 characters.
+The browser asks for HTTP Basic credentials; use any username and the token as
+the password. API clients may instead send `Authorization: Bearer <token>`.
+Use a trusted TLS tunnel for remote access. Cross-origin browser requests and
+unrecognized Host headers are rejected, including WebSocket handshakes.
+Keep credentials in local environment/configuration, outside source control.

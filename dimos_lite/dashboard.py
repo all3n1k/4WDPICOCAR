@@ -5,8 +5,10 @@ import json
 import os
 import time
 import cv2
+from dimos_lite.access_control import AccessPolicy
 
 PORT = 8080
+access_policy = AccessPolicy(os.environ)
 
 class DashboardState:
     def __init__(self):
@@ -91,7 +93,23 @@ state = DashboardState()
 
 
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
+    def _allowed(self):
+        denied = access_policy.check(self.headers)
+        if denied:
+            status, message = denied
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Cache-Control', 'no-store')
+            if status == 401:
+                self.send_header('WWW-Authenticate', 'Basic realm="Dashboard", charset="UTF-8"')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': message}).encode())
+            return False
+        return True
+
     def do_GET(self):
+        if not self._allowed():
+            return
         if self.path == '/':
             self._serve_html()
         elif self.path == '/video_feed':
@@ -102,10 +120,28 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._allowed():
+            return
+        if self.headers.get_content_type() != 'application/json':
+            self.send_error(415, 'JSON required')
+            return
+        try:
+            length = int(self.headers.get('Content-Length', '-1'))
+            if length < 0 or length > 65536:
+                self.send_error(413, 'Invalid request size')
+                return
+            self.connection.settimeout(5)
+            body = json.loads(self.rfile.read(length).decode('utf-8'))
+            if not isinstance(body, dict):
+                raise ValueError('JSON object required')
+        except (ValueError, UnicodeError, TimeoutError):
+            self.send_error(400, 'Invalid JSON object')
+            return
         if self.path == '/api/control':
-            length = int(self.headers['Content-Length'])
-            body = json.loads(self.rfile.read(length).decode())
             cmd = body.get('command')
+            if not isinstance(cmd, str) or cmd not in {'forward', 'backward', 'left', 'right', 'stop', 'forward_boost', 'backward_boost', 'left_boost', 'right_boost'}:
+                self.send_error(400, 'Unknown movement command')
+                return
             with state.lock:
                 # `stop` is a kill-switch, never a queue entry. The moment
                 # one arrives, throw away everything else and queue ONLY the
@@ -128,8 +164,6 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
         elif self.path == '/api/set_marker':
-            length = int(self.headers['Content-Length'])
-            body = json.loads(self.rfile.read(length).decode())
             mid = int(body.get('id', 0))
             x, y = float(body.get('x', 350)), float(body.get('y', 350))
             with state.lock:
@@ -140,8 +174,6 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"ok": True}).encode())
         elif self.path == '/api/set_position':
-            length = int(self.headers['Content-Length'])
-            body = json.loads(self.rfile.read(length).decode())
             x, y = float(body.get('x', 350)), float(body.get('y', 350))
             with state.lock:
                 state.position_override = (x, y)
@@ -152,8 +184,6 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"ok": True, "x": x, "y": y}).encode())
         elif self.path == '/api/pin_marker':
-            length = int(self.headers['Content-Length'])
-            body = json.loads(self.rfile.read(length).decode())
             mid = int(body.get('id'))
             mtype = body.get('type', 'floor')
             entry = {
@@ -170,8 +200,6 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"ok": True, "count": len(state.survey_pins)}).encode())
         elif self.path == '/api/unpin_marker':
-            length = int(self.headers['Content-Length'])
-            body = json.loads(self.rfile.read(length).decode())
             mid = int(body.get('id'))
             with state.lock:
                 state.survey_pins.pop(mid, None)
@@ -213,8 +241,6 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             # publish → WS" down to "HTTP → method call → WS", eliminating
             # the agent-loop wait (was up to 50ms, now 10ms — but irrelevant
             # because we no longer use that path) and any queue buildup.
-            length = int(self.headers['Content-Length'])
-            body = json.loads(self.rfile.read(length).decode())
             pin = int(body.get('pin', 21))
             angle = int(body.get('angle', 90))
             hw = state.pico_hw
@@ -225,8 +251,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
         elif self.path == '/api/led':
-            length = int(self.headers['Content-Length'])
-            data = json.loads(self.rfile.read(length).decode())
+            data = body
             brightness = data.get('brightness', 0)
             print(f"[Dashboard] LED toggle request: brightness={brightness}")
             
@@ -1257,25 +1282,10 @@ poll();
 </html>"""
 
 def start_dashboard():
+    access_policy.validate_configuration()
     socketserver.ThreadingTCPServer.allow_reuse_address = True
-    try:
-        server = socketserver.ThreadingTCPServer(("", PORT), DashboardHandler)
-    except OSError:
-        # Port already in use from a previous session — kill it and retry
-        import socket, os, signal
-        try:
-            s = socket.socket()
-            s.connect(('127.0.0.1', PORT))
-            s.close()
-        except Exception:
-            pass
-        import subprocess
-        pids = subprocess.run(['lsof', '-ti', f':{PORT}'], capture_output=True, text=True).stdout.strip().split()
-        for pid in pids:
-            try: os.kill(int(pid), signal.SIGKILL)
-            except Exception: pass
-        import time as _t; _t.sleep(0.5)
-        server = socketserver.ThreadingTCPServer(("", PORT), DashboardHandler)
+    # A bind failure belongs to the caller; never kill another process to claim it.
+    server = socketserver.ThreadingTCPServer((access_policy.host, PORT), DashboardHandler)
     server.daemon_threads = True
     print(f"[Dashboard] http://localhost:{PORT}")
     threading.Thread(target=server.serve_forever, daemon=True).start()
